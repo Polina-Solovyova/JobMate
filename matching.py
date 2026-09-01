@@ -1,208 +1,509 @@
-import re
-from typing import Dict, List, Optional, Tuple
 import logging
-from rapidfuzz import fuzz, process
-import pymorphy2
+import re
+from typing import Dict, List, Set
+
+from rapidfuzz import fuzz
 
 logger = logging.getLogger(__name__)
 
-# Инициализируем морфологический анализатор для русского языка
-morph = pymorphy2.MorphAnalyzer()
 
-# Расширенный словарь синонимов (можно дополнять)
 SYNONYMS = {
-    # Профессии
-    "разработчик": ["программист", "developer", "кодер"],
-    "дизайнер": ["designer", "ux/ui", "продуктовый дизайнер"],
-    
-    # Технологии
-    "figma": ["фигма"],
-    "photoshop": ["фотошоп"],
-    
-    # Условия работы
-    "удалённо": ["remote", "дистанционно", "удаленка", "удалёнка"],
-    "офис": ["в офисе", "офисная работа"],
-    "гибрид": ["hybrid", "смешанный"],
-    "полная занятость": ["full-time", "фуллтайм"],
-    "частичная занятость": ["part-time", "парттайм"],
-    "стажировка": ["internship", "intern"],
-    "без опыта": ["junior", "начинающий", "entry-level", "junior-", "стажёр"],
-    "опыт от": ["от года", "опыт работы"],
+    "разработчик": {
+        "программист",
+        "developer",
+        "software developer",
+        "software engineer",
+        "инженер разработчик",
+    },
+    "программист": {
+        "разработчик",
+        "developer",
+        "software developer",
+        "software engineer",
+    },
+    "дизайнер": {
+        "designer",
+        "ux designer",
+        "ui designer",
+        "product designer",
+        "продуктовый дизайнер",
+    },
+    "backend": {
+        "back end",
+        "backend developer",
+        "бэкенд",
+        "бекенд",
+    },
+    "frontend": {
+        "front end",
+        "frontend developer",
+        "фронтенд",
+    },
+    "python": {
+        "python developer",
+        "python разработчик",
+    },
+    "javascript": {
+        "js",
+        "javascript developer",
+    },
+    "typescript": {
+        "ts",
+    },
+    "figma": {
+        "фигма",
+    },
+    "photoshop": {
+        "фотошоп",
+    },
+    "удалённо": {
+        "удаленно",
+        "удаленка",
+        "удалёнка",
+        "remote",
+        "remote work",
+        "дистанционно",
+    },
+    "удаленно": {
+        "удалённо",
+        "удаленка",
+        "удалёнка",
+        "remote",
+        "remote work",
+        "дистанционно",
+    },
+    "офис": {
+        "в офисе",
+        "office",
+        "office work",
+    },
+    "гибрид": {
+        "hybrid",
+        "гибридный",
+        "смешанный формат",
+    },
+    "полная занятость": {
+        "full-time",
+        "full time",
+        "фуллтайм",
+    },
+    "частичная занятость": {
+        "part-time",
+        "part time",
+        "парттайм",
+    },
+    "стажировка": {
+        "internship",
+        "intern",
+        "стажёр",
+        "стажер",
+    },
+    "без опыта": {
+        "junior",
+        "entry-level",
+        "entry level",
+        "начинающий",
+        "без опыта",
+    },
 }
 
-# Кэш для лемматизированных слов
-_lemmatized_cache = {}
 
-def lemmatize_word(word: str) -> str:
-    """Лемматизация одного слова."""
-    if word in _lemmatized_cache:
-        return _lemmatized_cache[word]
-    parsed = morph.parse(word)[0]
-    normal_form = parsed.normal_form
-    _lemmatized_cache[word] = normal_form
-    return normal_form
+def normalize_text(text: str) -> str:
+    text = text.lower().replace("ё", "е")
 
-def tokenize_and_lemmatize(text: str) -> List[str]:
-    """Разбивает текст на слова, удаляет стоп-слова, лемматизирует."""
-    # Простая токенизация по словам
-    words = re.findall(r'[а-яёa-z]+', text.lower())
-    # Лемматизация
-    lemmas = [lemmatize_word(w) for w in words if len(w) > 1]
-    return lemmas
+    text = re.sub(
+        r"[^\w+#.\-/ ]+",
+        " ",
+        text,
+        flags=re.UNICODE,
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+    return text
+
+
+def tokenize(text: str) -> List[str]:
+    normalized = normalize_text(text)
+
+    return [
+        token
+        for token in normalized.split()
+        if len(token) > 1
+    ]
+
+
+def _stem_russian_word(word: str) -> str:
+    endings = (
+        "иями",
+        "ами",
+        "ями",
+        "ого",
+        "ему",
+        "ому",
+        "ими",
+        "ыми",
+        "ая",
+        "яя",
+        "ое",
+        "ее",
+        "ые",
+        "ие",
+        "ов",
+        "ев",
+        "ам",
+        "ям",
+        "ом",
+        "ем",
+        "ах",
+        "ях",
+        "ы",
+        "и",
+        "а",
+        "я",
+        "о",
+        "е",
+        "у",
+        "ю",
+    )
+
+    for ending in endings:
+        if len(word) > len(ending) + 2 and word.endswith(ending):
+            return word[:-len(ending)]
+
+    return word
+
+
+def normalize_term(term: str) -> str:
+    normalized = normalize_text(term)
+
+    words = normalized.split()
+
+    return " ".join(
+        _stem_russian_word(word)
+        for word in words
+    )
+
 
 def expand_with_synonyms(term: str) -> List[str]:
-    """Возвращает список синонимов для термина (включая сам термин)."""
-    term_lower = term.lower()
-    # Проверяем, есть ли синонимы (как ключ или как значение)
-    synonyms = set()
-    for key, values in SYNONYMS.items():
-        if term_lower == key:
-            synonyms.update(values)
-        elif term_lower in values:
-            synonyms.add(key)
-            synonyms.update(values)
-    # Добавляем сам термин
-    synonyms.add(term_lower)
-    return list(synonyms)
+    normalized = normalize_text(term)
 
-def fuzzy_match(needle: str, haystack: str, threshold: int = 85) -> bool:
-    """
-    Проверяет, содержится ли needle в haystack с учётом fuzzy-сравнения.
-    Используется частичное отношение (если needle длиннее, сравниваем части).
-    """
+    variants: Set[str] = {normalized}
+
+    for key, values in SYNONYMS.items():
+        key_normalized = normalize_text(key)
+
+        normalized_values = {
+            normalize_text(value)
+            for value in values
+        }
+
+        if normalized == key_normalized:
+            variants.add(key_normalized)
+            variants.update(normalized_values)
+
+        elif normalized in normalized_values:
+            variants.add(key_normalized)
+            variants.update(normalized_values)
+
+    return sorted(variants)
+
+
+def _contains_phrase(
+    phrase: str,
+    text: str,
+) -> bool:
+    phrase = normalize_text(phrase)
+    text = normalize_text(text)
+
+    if not phrase or not text:
+        return False
+
+    if phrase in text:
+        return True
+
+    phrase_words = phrase.split()
+
+    if len(phrase_words) == 1:
+        return False
+
+    text_words = text.split()
+    phrase_len = len(phrase_words)
+
+    for index in range(
+        len(text_words) - phrase_len + 1
+    ):
+        chunk = text_words[
+            index:index + phrase_len
+        ]
+
+        if all(
+            normalize_term(a) == normalize_term(b)
+            for a, b in zip(
+                phrase_words,
+                chunk,
+            )
+        ):
+            return True
+
+    return False
+
+
+def fuzzy_match(
+    needle: str,
+    haystack: str,
+    threshold: int = 90,
+) -> bool:
+    needle = normalize_text(needle)
+    haystack = normalize_text(haystack)
+
     if not needle or not haystack:
         return False
-    # Если простое вхождение уже есть
-    if needle in haystack:
-        return True
-    # Проверяем по отдельным словам
-    needle_words = needle.split()
-    haystack_words = haystack.split()
-    if not needle_words or not haystack_words:
-        return False
-    # Для каждого слова из needle ищем лучшее совпадение в haystack
-    for nw in needle_words:
-        # Ищем самое похожее слово
-        best = process.extractOne(nw, haystack_words, scorer=fuzz.ratio)
-        if best and best[1] >= threshold:
-            continue
-        else:
-            return False
-    return True
 
-def match_condition(condition: str, text_lemmas: List[str], text_raw: str, threshold: int = 85) -> bool:
-    """
-    Проверяет, выполняется ли условие (один термин) для текста.
-    Учитывает синонимы и fuzzy.
-    """
-    synonyms = expand_with_synonyms(condition)
-    for syn in synonyms:
-        # Проверяем точное совпадение лемм
-        syn_lemmas = tokenize_and_lemmatize(syn)
-        if all(sl in text_lemmas for sl in syn_lemmas):
+    if _contains_phrase(needle, haystack):
+        return True
+
+    needle_words = needle.split()
+
+    if len(needle_words) != 1:
+        return False
+
+    needle_word = needle_words[0]
+
+    if len(needle_word) < 5:
+        return False
+
+    text_words = haystack.split()
+
+    for word in text_words:
+        if len(word) < 5:
+            continue
+
+        ratio = fuzz.ratio(
+            needle_word,
+            word,
+        )
+
+        if ratio >= threshold:
             return True
-        # Проверяем fuzzy по сырому тексту
-        if fuzzy_match(syn, text_raw, threshold):
-            return True
+
     return False
+
+
+def match_condition(
+    condition: str,
+    text_lemmas: List[str],
+    text_raw: str,
+    threshold: int = 90,
+) -> bool:
+    if not condition:
+        return False
+
+    condition_variants = expand_with_synonyms(
+        condition
+    )
+
+    text_normalized = normalize_text(text_raw)
+
+    text_tokens = set(
+        normalize_term(token)
+        for token in text_lemmas
+    )
+
+    for variant in condition_variants:
+        variant_normalized = normalize_text(
+            variant
+        )
+
+        if _contains_phrase(
+            variant_normalized,
+            text_normalized,
+        ):
+            return True
+
+        variant_tokens = [
+            normalize_term(token)
+            for token in variant_normalized.split()
+        ]
+
+        if variant_tokens and all(
+            token in text_tokens
+            for token in variant_tokens
+        ):
+            return True
+
+        if len(variant_tokens) == 1:
+            if fuzzy_match(
+                variant_tokens[0],
+                text_normalized,
+                threshold,
+            ):
+                return True
+
+    return False
+
 
 def match_filter(
     filter_data: Dict,
     vacancy_text: str,
-    threshold: int = 85
+    threshold: int = 90,
 ) -> Dict:
-    """
-    Сопоставляет фильтр с текстом вакансии.
-    Возвращает:
-    {
-        "matched": bool,
-        "score": int (0-100),
-        "matched_conditions": List[str],
-        "missing_conditions": List[str],
-        "details": Dict  # для отладки
-    }
-    """
     if not vacancy_text or not filter_data:
         return {
             "matched": False,
             "score": 0,
             "matched_conditions": [],
             "missing_conditions": [],
-            "details": {}
+            "details": {},
         }
 
-    # Подготавливаем текст: леммы и сырой текст
-    text_lemmas = tokenize_and_lemmatize(vacancy_text)
-    text_raw = vacancy_text.lower()
+    text_normalized = normalize_text(
+        vacancy_text
+    )
 
-    required = filter_data.get("required", [])
-    optional = filter_data.get("optional", [])
-    excluded = filter_data.get("excluded", [])
+    text_lemmas = tokenize(
+        text_normalized
+    )
+
+    required = [
+        item
+        for item in filter_data.get("required", [])
+        if isinstance(item, str) and item.strip()
+    ]
+
+    optional = [
+        item
+        for item in filter_data.get("optional", [])
+        if isinstance(item, str) and item.strip()
+    ]
+
+    excluded = [
+        item
+        for item in filter_data.get("excluded", [])
+        if isinstance(item, str) and item.strip()
+    ]
 
     matched_required = []
     missing_required = []
     matched_optional = []
+    missing_optional = []
     excluded_found = []
 
-    # Проверяем обязательные (AND)
-    for req in required:
-        if match_condition(req, text_lemmas, text_raw, threshold):
-            matched_required.append(req)
+    for requirement in required:
+        if match_condition(
+            requirement,
+            text_lemmas,
+            text_normalized,
+            threshold,
+        ):
+            matched_required.append(requirement)
         else:
-            missing_required.append(req)
+            missing_required.append(requirement)
 
-    # Если не все обязательные выполнены → не подходит
     if missing_required:
         return {
             "matched": False,
             "score": 0,
             "matched_conditions": matched_required,
             "missing_conditions": missing_required,
-            "details": {"required": required, "optional": optional, "excluded": excluded}
+            "details": {
+                "required": required,
+                "optional": optional,
+                "excluded": excluded,
+                "matched_required": matched_required,
+                "matched_optional": [],
+                "excluded_found": [],
+            },
         }
 
-    # Проверяем исключения (NOT)
-    for exc in excluded:
-        if match_condition(exc, text_lemmas, text_raw, threshold):
-            excluded_found.append(exc)
+    for exclusion in excluded:
+        if match_condition(
+            exclusion,
+            text_lemmas,
+            text_normalized,
+            threshold,
+        ):
+            excluded_found.append(exclusion)
 
     if excluded_found:
         return {
             "matched": False,
             "score": 0,
             "matched_conditions": matched_required,
-            "missing_conditions": [f"Исключено: {', '.join(excluded_found)}"],
-            "details": {"excluded_found": excluded_found}
+            "missing_conditions": [
+                f"Исключено: {', '.join(excluded_found)}"
+            ],
+            "details": {
+                "required": required,
+                "optional": optional,
+                "excluded": excluded,
+                "matched_required": matched_required,
+                "matched_optional": [],
+                "excluded_found": excluded_found,
+            },
         }
 
-    # Проверяем желательные (OR)
-    for opt in optional:
-        if match_condition(opt, text_lemmas, text_raw, threshold):
-            matched_optional.append(opt)
+    for optional_item in optional:
+        if match_condition(
+            optional_item,
+            text_lemmas,
+            text_normalized,
+            threshold,
+        ):
+            matched_optional.append(optional_item)
+        else:
+            missing_optional.append(optional_item)
 
-    # Вычисляем score
     total_conditions = len(required) + len(optional)
-    matched_conditions = matched_required + matched_optional
-    score = int((len(matched_conditions) / total_conditions) * 100) if total_conditions > 0 else 0
+    matched_count = (
+        len(matched_required)
+        + len(matched_optional)
+    )
+
+    if total_conditions:
+        score = int(
+            matched_count
+            / total_conditions
+            * 100
+        )
+    else:
+        score = 100
+
+    matched_conditions = (
+        matched_required
+        + matched_optional
+    )
+
+    missing_conditions = missing_required + [
+        f"Не совпало: {item}"
+        for item in missing_optional
+    ]
 
     return {
         "matched": True,
         "score": score,
         "matched_conditions": matched_conditions,
-        "missing_conditions": [f"Не совпало: {', '.join(set(optional) - set(matched_optional))}"],
+        "missing_conditions": missing_conditions,
         "details": {
             "required": required,
             "optional": optional,
+            "excluded": excluded,
             "matched_required": matched_required,
             "matched_optional": matched_optional,
-            "excluded": excluded,
-            "excluded_found": excluded_found
-        }
+            "excluded_found": excluded_found,
+        },
     }
 
-# Упрощённая функция для интеграции с основным кодом
-def check_vacancy_against_filter(vacancy_text: str, filter_data: Dict) -> Dict:
-    """
-    Упрощённая обёртка для проверки.
-    """
-    return match_filter(filter_data, vacancy_text)
+
+def check_vacancy_against_filter(
+    vacancy_text: str,
+    filter_data: Dict,
+) -> Dict:
+    return match_filter(
+        filter_data=filter_data,
+        vacancy_text=vacancy_text,
+    )

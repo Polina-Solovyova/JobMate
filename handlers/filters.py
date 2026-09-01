@@ -1,193 +1,447 @@
-import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler
 
-from db import get_user_filters
-from filters import (
-    create_filter_from_query,
-    get_filters_for_user,
+from db import (
+    add_filter,
+    delete_filter,
+    get_filter,
+    get_filters,
     toggle_filter,
-    delete_filter_by_id
+    update_filter,
 )
-from keyboards import filters_list_keyboard, filter_actions_keyboard, main_menu_keyboard
+from filters import parse_query_to_filter
+from keyboards import (
+    filter_actions_keyboard,
+    filters_list_keyboard,
+    main_menu_keyboard,
+)
 
-logger = logging.getLogger(__name__)
-
-# Состояния для создания фильтра
 WAITING_FILTER_QUERY = 1
+WAITING_FILTER_EDIT = 2
 
-async def my_filters_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать список фильтров пользователя."""
+
+async def my_filters_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     query = update.callback_query
     await query.answer()
 
     user_id = update.effective_user.id
-    filters = await get_filters_for_user(user_id)
-
-    if not filters:
-        text = "🔎 Мои фильтры\n\nУ тебя пока нет сохранённых фильтров.\n\nСоздай свой первый поиск, нажав кнопку ниже."
-    else:
-        text = "🔎 Мои фильтры\n\nВыбери фильтр для управления:"
+    filters_data = await get_filters(user_id)
 
     await query.edit_message_text(
-        text,
-        reply_markup=filters_list_keyboard(filters)
+        "Ваши фильтры:",
+        reply_markup=filters_list_keyboard(filters_data),
     )
 
-async def add_filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начать создание фильтра — запросить текстовый запрос."""
+
+async def add_filter_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     query = update.callback_query
     await query.answer()
 
+    context.user_data.pop("editing_filter_id", None)
+
     await query.edit_message_text(
-        "➕ Новый поиск\n\n"
-        "Напиши, какую работу ты ищешь.\n\n"
+        "Введите описание вакансии для фильтра.\n\n"
         "Например:\n"
-        "UX/UI дизайнер удалённо, без опыта\n\n"
-        "Или:\n"
-        "Python разработчик, но не джуниор",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_add_filter")]
-        ])
+        "Python developer в Риге, удалённо, от 2000 EUR"
     )
+
     return WAITING_FILTER_QUERY
 
-async def cancel_add_filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отменить создание фильтра."""
+
+async def cancel_filter_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     query = update.callback_query
     await query.answer()
+
+    context.user_data.pop("editing_filter_id", None)
+
     await query.edit_message_text(
-        "Создание фильтра отменено.",
-        reply_markup=main_menu_keyboard()
+        "Действие отменено.",
+        reply_markup=main_menu_keyboard(),
     )
+
     return ConversationHandler.END
 
-async def filter_query_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текстового запроса для создания фильтра."""
-    user_id = update.effective_user.id
-    query_text = update.message.text.strip()
 
-    if not query_text:
-        await update.message.reply_text("Пожалуйста, введите запрос.")
-        return WAITING_FILTER_QUERY
-
-    result = await create_filter_from_query(user_id, query_text)
-
-    if not result["success"]:
-        await update.message.reply_text(
-            f"❌ Ошибка: {result.get('error', 'Неизвестная ошибка')}\n\n"
-            "Попробуй ещё раз.",
-            reply_markup=main_menu_keyboard()
-        )
+async def filter_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not update.message or not update.message.text:
         return ConversationHandler.END
 
-    filter_data = result["filter"]
-    name = filter_data.get("name", "Без названия")
-    required = ", ".join(filter_data.get("required", []))
-    optional = ", ".join(filter_data.get("optional", []))
-    excluded = ", ".join(filter_data.get("excluded", []))
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
 
-    text = (
-        f"✅ Фильтр создан!\n\n"
-        f"📌 {name}\n"
-        f"Обязательно: {required if required else '—'}\n"
-        f"Желательно: {optional if optional else '—'}\n"
-        f"Исключения: {excluded if excluded else '—'}\n\n"
-        f"Теперь я буду искать вакансии по этому запросу."
+    if not text:
+        await update.message.reply_text(
+            "Введите непустой запрос."
+        )
+        return WAITING_FILTER_QUERY
+
+    editing_filter_id = context.user_data.get(
+        "editing_filter_id"
+    )
+
+    try:
+        parsed = parse_query_to_filter(text)
+    except Exception:
+        await update.message.reply_text(
+            "Не удалось разобрать запрос. "
+            "Попробуйте сформулировать его проще."
+        )
+        return (
+            WAITING_FILTER_EDIT
+            if editing_filter_id
+            else WAITING_FILTER_QUERY
+        )
+
+    if not parsed:
+        await update.message.reply_text(
+            "Не удалось создать фильтр из этого запроса."
+        )
+        return (
+            WAITING_FILTER_EDIT
+            if editing_filter_id
+            else WAITING_FILTER_QUERY
+        )
+
+    name = parsed.get("name") or text[:80]
+
+    filter_updates = {
+        "name": name,
+        "query": text,
+        "required": parsed.get("required", []),
+        "optional": parsed.get("optional", []),
+        "excluded": parsed.get("excluded", []),
+        "location": parsed.get("location"),
+        "experience": parsed.get("experience"),
+    }
+
+    if editing_filter_id:
+        existing_filter = await get_filter(
+            user_id=user_id,
+            filter_id=editing_filter_id,
+        )
+
+        if not existing_filter:
+            context.user_data.pop(
+                "editing_filter_id",
+                None,
+            )
+
+            await update.message.reply_text(
+                "Фильтр не найден.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+            return ConversationHandler.END
+
+        updated = await update_filter(
+            user_id=user_id,
+            filter_id=editing_filter_id,
+            updates=filter_updates,
+        )
+
+        context.user_data.pop(
+            "editing_filter_id",
+            None,
+        )
+
+        if not updated:
+            await update.message.reply_text(
+                "Не удалось обновить фильтр.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return ConversationHandler.END
+
+        await update.message.reply_text(
+            "Фильтр обновлён.",
+            reply_markup=main_menu_keyboard(),
+        )
+
+        return ConversationHandler.END
+
+    filter_id = await add_filter(
+        user_id=user_id,
+        name=name,
+        query=text,
+        required=parsed.get("required", []),
+        optional=parsed.get("optional", []),
+        excluded=parsed.get("excluded", []),
+        location=parsed.get("location"),
+        experience=parsed.get("experience"),
+        enabled=True,
     )
 
     await update.message.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔎 Мои фильтры", callback_data="my_filters")],
-            [InlineKeyboardButton("➕ Добавить ещё", callback_data="add_filter")],
-        ])
+        f"Фильтр «{name}» создан.",
+        reply_markup=main_menu_keyboard(),
     )
+
     return ConversationHandler.END
 
-async def filter_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать детали фильтра."""
+
+async def filter_detail_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     query = update.callback_query
     await query.answer()
 
-    filter_id = query.data.replace("filter_", "")
     user_id = update.effective_user.id
-    filters = await get_filters_for_user(user_id)
-    filter_item = next((f for f in filters if str(f["_id"]) == filter_id), None)
+    filter_id = query.data.replace(
+        "filter_",
+        "",
+        1,
+    )
 
-    if not filter_item:
-        await query.edit_message_text("Фильтр не найден.", reply_markup=main_menu_keyboard())
+    filter_data = await get_filter(
+        user_id=user_id,
+        filter_id=filter_id,
+    )
+
+    if not filter_data:
+        await query.edit_message_text(
+            "Фильтр не найден.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
-    filter_data = filter_item.get("filter_data", {})
-    name = filter_data.get("name", "Без названия")
-    required = ", ".join(filter_data.get("required", []))
-    optional = ", ".join(filter_data.get("optional", []))
-    excluded = ", ".join(filter_data.get("excluded", []))
-    is_enabled = filter_item.get("enabled", True)
-
-    status = "🟢 Активен" if is_enabled else "⏸ На паузе"
-
-    text = (
-        f"🔎 {name}\n\n"
-        f"Статус: {status}\n"
-        f"Обязательно: {required if required else '—'}\n"
-        f"Желательно: {optional if optional else '—'}\n"
-        f"Исключения: {excluded if excluded else '—'}\n"
+    name = filter_data.get(
+        "name",
+        "Без названия",
     )
+
+    original_query = filter_data.get(
+        "query",
+        "",
+    )
+
+    enabled = filter_data.get(
+        "enabled",
+        True,
+    )
+
+    required = filter_data.get(
+        "required",
+        [],
+    )
+
+    optional = filter_data.get(
+        "optional",
+        [],
+    )
+
+    excluded = filter_data.get(
+        "excluded",
+        [],
+    )
+
+    location = filter_data.get(
+        "location"
+    )
+
+    experience = filter_data.get(
+        "experience"
+    )
+
+    lines = [
+        f"Фильтр: {name}",
+        "",
+        f"Статус: {'включён' if enabled else 'выключен'}",
+        f"Запрос: {original_query}",
+    ]
+
+    if required:
+        lines.extend(
+            [
+                "",
+                "Обязательное:",
+                ", ".join(required),
+            ]
+        )
+
+    if optional:
+        lines.extend(
+            [
+                "",
+                "Дополнительно:",
+                ", ".join(optional),
+            ]
+        )
+
+    if excluded:
+        lines.extend(
+            [
+                "",
+                "Исключить:",
+                ", ".join(excluded),
+            ]
+        )
+
+    if location:
+        lines.extend(
+            [
+                "",
+                f"Локация: {location}",
+            ]
+        )
+
+    if experience:
+        lines.extend(
+            [
+                "",
+                f"Опыт: {experience}",
+            ]
+        )
 
     await query.edit_message_text(
-        text,
-        reply_markup=filter_actions_keyboard(filter_id, is_enabled)
+        "\n".join(lines),
+        reply_markup=filter_actions_keyboard(
+            filter_id=str(filter_data["_id"]),
+            enabled=enabled,
+        ),
     )
 
-async def filter_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка действий с фильтром (toggle, delete)."""
+
+async def filter_action_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     query = update.callback_query
     await query.answer()
 
-    data = query.data
-    parts = data.split("_")
-    action = parts[0]
-    filter_id = "_".join(parts[1:])  # на случай, если в ID есть подчёркивания
+    user_id = update.effective_user.id
+    data = query.data or ""
+
+    if data.startswith("toggle_filter_"):
+        action = "toggle"
+        filter_id = data.replace(
+            "toggle_filter_",
+            "",
+            1,
+        )
+
+    elif data.startswith("delete_filter_"):
+        action = "delete"
+        filter_id = data.replace(
+            "delete_filter_",
+            "",
+            1,
+        )
+
+    elif data.startswith("confirm_delete_"):
+        action = "confirm_delete"
+        filter_id = data.replace(
+            "confirm_delete_",
+            "",
+            1,
+        )
+
+    elif data.startswith("edit_filter_"):
+        action = "edit"
+        filter_id = data.replace(
+            "edit_filter_",
+            "",
+            1,
+        )
+
+    else:
+        return
+
+    filter_data = await get_filter(
+        user_id=user_id,
+        filter_id=filter_id,
+    )
+
+    if not filter_data:
+        await query.edit_message_text(
+            "Фильтр не найден.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
 
     if action == "toggle":
-        # Получаем текущий статус
-        user_id = update.effective_user.id
-        filters = await get_filters_for_user(user_id)
-        filter_item = next((f for f in filters if str(f["_id"]) == filter_id), None)
-        if not filter_item:
-            await query.edit_message_text("Фильтр не найден.")
+        enabled = not filter_data.get(
+            "enabled",
+            True,
+        )
+
+        updated = await toggle_filter(
+            user_id=user_id,
+            filter_id=filter_id,
+            enabled=enabled,
+        )
+
+        if not updated:
+            await query.edit_message_text(
+                "Не удалось изменить статус фильтра.",
+                reply_markup=main_menu_keyboard(),
+            )
             return
-        new_enabled = not filter_item.get("enabled", True)
-        await toggle_filter(filter_id, new_enabled)
-        status_text = "активен" if new_enabled else "на паузе"
-        await query.answer(f"Фильтр {status_text}")
 
-        # Обновляем детали
-        await filter_detail_callback(update, context)
-
-    elif action == "delete":
-        # Подтверждение удаления
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_{filter_id}"),
-                InlineKeyboardButton("❌ Нет", callback_data=f"filter_{filter_id}")
-            ]
-        ]
         await query.edit_message_text(
-            "🗑 Удалить фильтр?\n\n"
-            "Это действие нельзя отменить.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "Фильтр включён."
+            if enabled
+            else "Фильтр выключен.",
+            reply_markup=filter_actions_keyboard(
+                filter_id=filter_id,
+                enabled=enabled,
+            ),
+        )
+        return
+
+    if action == "delete":
+        await query.edit_message_text(
+            "Удалить этот фильтр?",
+            reply_markup=filter_actions_keyboard(
+                filter_id=filter_id,
+                enabled=filter_data.get(
+                    "enabled",
+                    True,
+                ),
+                confirm_delete=True,
+            ),
+        )
+        return
+
+    if action == "confirm_delete":
+        deleted = await delete_filter(
+            user_id=user_id,
+            filter_id=filter_id,
         )
 
-    elif action == "confirm_delete":
-        await delete_filter_by_id(filter_id)
-        await query.answer("Фильтр удалён")
-        # Возвращаемся к списку
-        user_id = update.effective_user.id
-        filters = await get_filters_for_user(user_id)
+        if deleted:
+            await query.edit_message_text(
+                "Фильтр удалён.",
+                reply_markup=main_menu_keyboard(),
+            )
+        else:
+            await query.edit_message_text(
+                "Фильтр не найден.",
+                reply_markup=main_menu_keyboard(),
+            )
+
+        return
+
+    if action == "edit":
+        context.user_data[
+            "editing_filter_id"
+        ] = filter_id
+
         await query.edit_message_text(
-            "Фильтр удалён.",
-            reply_markup=filters_list_keyboard(filters)
+            "Введите новый запрос для фильтра.\n\n"
+            f"Текущий запрос:\n"
+            f"{filter_data.get('query', '')}"
         )
+
+        return WAITING_FILTER_EDIT

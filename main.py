@@ -1,207 +1,693 @@
-# main.py
-import os
-import asyncio
 import logging
-from dotenv import load_dotenv
+
 from telegram import Update
 from telegram.ext import (
     Application,
-    CommandHandler,
+    ApplicationBuilder,
     CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
     MessageHandler,
     filters,
-    ConversationHandler,
-    ContextTypes
 )
 
 from config import BOT_TOKEN
-from db import get_user_filters
-from handlers.start import start_command
-from handlers.channels import (
-    main_menu_callback,
-    my_channels_callback,
-    add_channel_callback,
-    cancel_add_channel_callback,
-    add_channel_input,
-    retry_check_callback,
-    channel_detail_callback,
-    channel_action_callback,
-    WAITING_CHANNEL_INPUT
+from db import (
+    create_indexes,
+    create_user,
+    get_user_filters,
+    mark_post_processed,
 )
-from handlers.filters import (
-    my_filters_callback,
+from filters import (
     add_filter_callback,
-    cancel_add_filter_callback,
-    filter_query_input,
-    filter_detail_callback,
+    cancel_filter_callback,
     filter_action_callback,
-    WAITING_FILTER_QUERY
+    filter_detail_callback,
+    filter_input,
+    my_filters_callback,
+)
+from handlers.channels import (
+    WAITING_CHANNEL,
+    add_channel_callback,
+    add_channel_input,
+    cancel_channel_callback,
+    delete_channel_callback,
+    my_channels_callback,
+    retry_channel_callback,
+    toggle_channel_callback,
 )
 from keyboards import main_menu_keyboard
-from telegram_client import TelegramUserClient
-from vacancies import process_post_with_filters
 from notifications import send_vacancy_notification
-from db import get_user_channel, update_post_vacancy_status
+from telegram_client import TelegramUserClient
+from telegram_clients import (
+    get_telegram_client,
+    start_user_polling,
+    stop_all_clients,
+)
+from vacancies import process_post_with_filters
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
+
 logger = logging.getLogger(__name__)
 
-# Переменная для ID владельца (если задан в .env)
-OWNER_USER_ID = os.getenv("OWNER_USER_ID")
-if OWNER_USER_ID:
-    OWNER_USER_ID = int(OWNER_USER_ID)
 
-async def post_processor(user_id: int, channel_id: int, message_id: int, text: str, posted_at):
-    """Обработчик нового поста из Telethon."""
-    logger.info(f"Новый пост в канале {channel_id}, сообщение {message_id}")
+AUTH_PHONE = 1
+AUTH_CODE = 2
+AUTH_PASSWORD = 3
 
-    # Получаем фильтры пользователя
-    filters = await get_user_filters(user_id)
-    if not filters:
-        logger.info(f"Нет фильтров у пользователя {user_id}, пропускаем")
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user = update.effective_user
+
+    await create_user(
+        user_id=user.id,
+        username=user.username,
+    )
+
+    client = await get_telegram_client(
+        user.id
+    )
+
+    if await client.is_authorized():
+        await start_user_polling(user.id)
+
+        await update.message.reply_text(
+            "Telegram-аккаунт подключён.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
-    # Обрабатываем пост через vacancies + matching
-    results = process_post_with_filters(text, filters)
-    if not results:
-        logger.info(f"Пост не является вакансией или не прошёл фильтры")
-        return
+    await update.message.reply_text(
+        "Telegram-аккаунт не подключён.\n\n"
+        "Используйте /connect для подключения."
+    )
 
-    # Для каждого совпавшего фильтра отправляем уведомление
-    for res in results:
-        match_result = res["match_result"]
-        if match_result["matched"] and match_result["score"] >= 75:
-            vacancy_data = res["vacancy_data"]
-            filter_name = res["filter_name"]
-            score = match_result["score"]
-            matched_conditions = match_result["matched_conditions"]
 
-            # Получаем информацию о канале для ссылки
-            channel = await get_user_channel(user_id, channel_id)
-            if channel:
-                channel_username = channel.get("username")
-                # Формируем ссылку на пост
-                if channel_username:
-                    username_clean = channel_username.lstrip('@')
-                    post_link = f"https://t.me/{username_clean}/{message_id}"
-                else:
-                    # Если нет username, используем ID
-                    channel_id_str = str(channel_id).replace('-100', '')
-                    post_link = f"https://t.me/c/{channel_id_str}/{message_id}"
-            else:
-                post_link = None
-                channel_username = None
+async def connect_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user = update.effective_user
 
-            # Отправляем уведомление
-            await send_vacancy_notification(
-                bot=application.bot,
-                user_id=user_id,
-                vacancy_data=vacancy_data,
-                filter_name=filter_name,
-                score=score,
-                matched_conditions=matched_conditions,
-                post_link=post_link,
-                channel_username=channel_username
+    await create_user(
+        user_id=user.id,
+        username=user.username,
+    )
+
+    client = await get_telegram_client(
+        user.id
+    )
+
+    if await client.is_authorized():
+        await start_user_polling(user.id)
+
+        await update.message.reply_text(
+            "Telegram-аккаунт уже подключён.",
+            reply_markup=main_menu_keyboard(),
+        )
+
+        return ConversationHandler.END
+
+    context.user_data.pop(
+        "auth_phone",
+        None,
+    )
+    context.user_data.pop(
+        "phone_code_hash",
+        None,
+    )
+
+    await update.message.reply_text(
+        "Введите номер телефона Telegram "
+        "в международном формате.\n\n"
+        "Например: +371XXXXXXXX"
+    )
+
+    return AUTH_PHONE
+
+
+async def auth_phone(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not update.message or not update.message.text:
+        return AUTH_PHONE
+
+    user_id = update.effective_user.id
+    phone = update.message.text.strip()
+
+    client = await get_telegram_client(
+        user_id
+    )
+
+    try:
+        sent_code = await client.send_code(
+            phone
+        )
+
+        context.user_data["auth_phone"] = phone
+        context.user_data["phone_code_hash"] = (
+            sent_code.phone_code_hash
+        )
+
+        await update.message.reply_text(
+            "Код отправлен в Telegram.\n\n"
+            "Введите полученный код."
+        )
+
+        return AUTH_CODE
+
+    except Exception:
+        logger.exception(
+            "Failed to send Telegram code "
+            "for user %s",
+            user_id,
+        )
+
+        await update.message.reply_text(
+            "Не удалось отправить код. "
+            "Проверьте номер телефона и попробуйте ещё раз."
+        )
+
+        return AUTH_PHONE
+
+
+async def auth_code(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not update.message or not update.message.text:
+        return AUTH_CODE
+
+    user_id = update.effective_user.id
+    code = update.message.text.strip()
+
+    phone = context.user_data.get(
+        "auth_phone"
+    )
+    phone_code_hash = context.user_data.get(
+        "phone_code_hash"
+    )
+
+    if not phone or not phone_code_hash:
+        await update.message.reply_text(
+            "Сессия подключения потеряна. "
+            "Запустите /connect заново."
+        )
+
+        return ConversationHandler.END
+
+    client = await get_telegram_client(
+        user_id
+    )
+
+    try:
+        result = await client.sign_in(
+            phone=phone,
+            code=code,
+            phone_code_hash=phone_code_hash,
+        )
+
+        if result == "password":
+            await update.message.reply_text(
+                "Для аккаунта включена двухфакторная "
+                "аутентификация.\n\n"
+                "Введите пароль Telegram."
             )
 
-            # Обновляем статус поста в БД
-            await update_post_vacancy_status(
-                user_id, channel_id, message_id,
-                is_vacancy=True,
-                vacancy_data=vacancy_data
+            return AUTH_PASSWORD
+
+        context.user_data.pop(
+            "auth_phone",
+            None,
+        )
+        context.user_data.pop(
+            "phone_code_hash",
+            None,
+        )
+
+        await start_user_polling(
+            user_id
+        )
+
+        await update.message.reply_text(
+            "Telegram-аккаунт успешно подключён.",
+            reply_markup=main_menu_keyboard(),
+        )
+
+        return ConversationHandler.END
+
+    except Exception:
+        logger.exception(
+            "Failed to sign in Telegram account "
+            "for user %s",
+            user_id,
+        )
+
+        await update.message.reply_text(
+            "Не удалось войти в Telegram. "
+            "Проверьте код и попробуйте ещё раз."
+        )
+
+        return AUTH_CODE
+
+
+async def auth_password(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not update.message or not update.message.text:
+        return AUTH_PASSWORD
+
+    user_id = update.effective_user.id
+    password = update.message.text.strip()
+
+    client = await get_telegram_client(
+        user_id
+    )
+
+    try:
+        await client.sign_in_password(
+            password
+        )
+
+        context.user_data.pop(
+            "auth_phone",
+            None,
+        )
+        context.user_data.pop(
+            "phone_code_hash",
+            None,
+        )
+
+        await start_user_polling(
+            user_id
+        )
+
+        await update.message.reply_text(
+            "Telegram-аккаунт успешно подключён.",
+            reply_markup=main_menu_keyboard(),
+        )
+
+        return ConversationHandler.END
+
+    except Exception:
+        logger.exception(
+            "Failed to sign in with 2FA password "
+            "for user %s",
+            user_id,
+        )
+
+        await update.message.reply_text(
+            "Неверный пароль или не удалось завершить "
+            "авторизацию. Попробуйте ещё раз."
+        )
+
+        return AUTH_PASSWORD
+
+
+async def cancel_auth(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    context.user_data.pop(
+        "auth_phone",
+        None,
+    )
+    context.user_data.pop(
+        "phone_code_hash",
+        None,
+    )
+
+    await update.message.reply_text(
+        "Подключение отменено."
+    )
+
+    return ConversationHandler.END
+
+
+async def post_processor(
+    post: dict,
+):
+    user_id = post["user_id"]
+    channel_id = int(
+        post["channel_id"]
+    )
+    message_id = int(
+        post["message_id"]
+    )
+
+    text = post.get("text") or ""
+
+    try:
+        result = await process_post_with_filters(
+            text=text,
+            user_id=user_id,
+        )
+
+        is_vacancy = result.get(
+            "is_vacancy",
+            False,
+        )
+
+        vacancy_data = result.get(
+            "vacancy_data"
+        )
+
+        await mark_post_processed(
+            user_id=user_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            is_vacancy=is_vacancy,
+            vacancy_data=vacancy_data,
+        )
+
+        if not is_vacancy:
+            return
+
+        matched_filters = result.get(
+            "matched_filters",
+            [],
+        )
+
+        if not matched_filters:
+            return
+
+        channel_username = post.get(
+            "channel_username"
+        )
+
+        channel_title = post.get(
+            "channel_title"
+        )
+
+        post_link = None
+
+        if channel_username:
+            post_link = (
+                f"https://t.me/"
+                f"{channel_username.lstrip('@')}/"
+                f"{message_id}"
             )
 
-# Глобальная ссылка на приложение для доступа в колбэках
-application = None
+        await send_vacancy_notification(
+            user_id=user_id,
+            text=text,
+            channel_title=channel_title,
+            channel_username=channel_username,
+            post_link=post_link,
+            matched_filters=matched_filters,
+        )
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Ошибка: {context.error}")
+    except Exception:
+        logger.exception(
+            "Failed to process post %s/%s "
+            "for user %s",
+            channel_id,
+            message_id,
+            user_id,
+        )
+
+
+def build_auth_conversation():
+    return ConversationHandler(
+        entry_points=[
+            CommandHandler(
+                "connect",
+                connect_command,
+            )
+        ],
+        states={
+            AUTH_PHONE: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    auth_phone,
+                )
+            ],
+            AUTH_CODE: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    auth_code,
+                )
+            ],
+            AUTH_PASSWORD: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    auth_password,
+                )
+            ],
+        },
+        fallbacks=[
+            CommandHandler(
+                "cancel",
+                cancel_auth,
+            )
+        ],
+    )
+
+
+def build_channel_conversation():
+    return ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(
+                add_channel_callback,
+                pattern=r"^add_channel$",
+            )
+        ],
+        states={
+            WAITING_CHANNEL: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    add_channel_input,
+                ),
+                CallbackQueryHandler(
+                    cancel_channel_callback,
+                    pattern=r"^main_menu$",
+                ),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(
+                cancel_channel_callback,
+                pattern=r"^main_menu$",
+            ),
+            CommandHandler(
+                "cancel",
+                cancel_auth,
+            ),
+        ],
+    )
+
+
+def build_filter_conversation():
+    return ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(
+                add_filter_callback,
+                pattern=r"^add_filter$",
+            ),
+            CallbackQueryHandler(
+                filter_action_callback,
+                pattern=r"^edit_filter_",
+            ),
+        ],
+        states={
+            1: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    filter_input,
+                ),
+            ],
+            2: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    filter_input,
+                ),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(
+                cancel_filter_callback,
+                pattern=r"^my_filters$",
+            ),
+            CommandHandler(
+                "cancel",
+                cancel_auth,
+            ),
+        ],
+    )
+
+
+async def post_init(
+    application: Application,
+):
+    await create_indexes()
+
+
+async def post_shutdown(
+    application: Application,
+):
+    await stop_all_clients()
+
+
+def build_application() -> Application:
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is not configured"
+        )
+
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_handler(
+        build_auth_conversation()
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command,
+        )
+    )
+
+    application.add_handler(
+        build_channel_conversation()
+    )
+
+    application.add_handler(
+        build_filter_conversation()
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            my_channels_callback,
+            pattern=r"^my_channels$",
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            toggle_channel_callback,
+            pattern=r"^toggle_channel_",
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            delete_channel_callback,
+            pattern=r"^delete_channel_",
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            retry_channel_callback,
+            pattern=r"^retry_channel_",
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            my_filters_callback,
+            pattern=r"^my_filters$",
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            filter_detail_callback,
+            pattern=r"^filter_",
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            filter_action_callback,
+            pattern=(
+                r"^(toggle_filter_|"
+                r"delete_filter_|"
+                r"confirm_delete_|"
+                r"edit_filter_)"
+            ),
+        )
+    )
+
+    application.bot_data[
+        "post_processor"
+    ] = post_processor
+
+    return application
+
+
+def setup_user_client_callback(
+    client: TelegramUserClient,
+):
+    client.set_new_post_callback(
+        post_processor
+    )
+
+
+async def initialize_authorized_clients():
+    users = await _get_authorized_users()
+
+    for user in users:
+        user_id = user["user_id"]
+
+        try:
+            client = await get_telegram_client(
+                user_id
+            )
+
+            setup_user_client_callback(
+                client
+            )
+
+            await start_user_polling(
+                user_id
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to initialize Telegram "
+                "client for user %s",
+                user_id,
+            )
+
+
+async def _get_authorized_users():
+    from db import users_col
+
+    return await users_col.find(
+        {}
+    ).to_list(length=None)
+
 
 def main():
-    global application
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_error_handler(error_handler)
+    application = build_application()
 
-    # --- Добавляем хендлеры ---
-    # Старт
-    application.add_handler(CommandHandler("start", start_command))
-
-    # Callback'и главного меню
-    application.add_handler(CallbackQueryHandler(main_menu_callback, pattern="^main_menu$"))
-    application.add_handler(CallbackQueryHandler(my_channels_callback, pattern="^my_channels$"))
-    application.add_handler(CallbackQueryHandler(my_filters_callback, pattern="^my_filters$"))
-
-    # --- Каналы ---
-    # Добавление канала (ConversationHandler)
-    add_channel_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(add_channel_callback, pattern="^add_channel$")],
-        states={
-            WAITING_CHANNEL_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_input)
-            ]
-        },
-        fallbacks=[
-            CallbackQueryHandler(cancel_add_channel_callback, pattern="^cancel_add_channel$"),
-            CommandHandler("start", start_command)
-        ],
-        allow_reentry=True
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
     )
-    application.add_handler(add_channel_conv)
 
-    # Действия с каналами
-    application.add_handler(CallbackQueryHandler(retry_check_callback, pattern="^retry_check_"))
-    application.add_handler(CallbackQueryHandler(channel_detail_callback, pattern="^channel_"))
-    application.add_handler(CallbackQueryHandler(channel_action_callback, pattern="^(toggle|delete|confirm_delete|vacancies|notify)_"))
-
-    # --- Фильтры ---
-    # Добавление фильтра (ConversationHandler)
-    add_filter_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(add_filter_callback, pattern="^add_filter$")],
-        states={
-            WAITING_FILTER_QUERY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, filter_query_input)
-            ]
-        },
-        fallbacks=[
-            CallbackQueryHandler(cancel_add_filter_callback, pattern="^cancel_add_filter$"),
-            CommandHandler("start", start_command)
-        ],
-        allow_reentry=True
-    )
-    application.add_handler(add_filter_conv)
-
-    # Действия с фильтрами
-    application.add_handler(CallbackQueryHandler(filter_detail_callback, pattern="^filter_"))
-    application.add_handler(CallbackQueryHandler(filter_action_callback, pattern="^(toggle|delete|confirm_delete)_filter_"))
-
-    # --- Запуск Telethon клиента ---
-    if OWNER_USER_ID:
-        logger.info(f"Запуск Telethon клиента для пользователя {OWNER_USER_ID}")
-        client = TelegramUserClient(OWNER_USER_ID)
-
-        # Запускаем клиент и опрос в фоне
-        async def init_client():
-            await client.start()
-            # Устанавливаем колбэк для новых постов
-            client.set_new_post_callback(post_processor)
-            await client.start_polling()
-            # Сохраняем клиент в bot_data для доступа из хендлеров
-            application.bot_data["telegram_client"] = client
-            logger.info("Telethon клиент запущен и опрос каналов активен")
-
-        asyncio.create_task(init_client())
-    else:
-        logger.warning("OWNER_USER_ID не задан. Telethon клиент не запущен. Бот будет работать только с UI.")
-
-    # Запуск бота
-    logger.info("Бот запущен...")
-    application.run_polling()
 
 if __name__ == "__main__":
-    import platform
-    if platform.system() == "Windows":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     main()

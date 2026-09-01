@@ -1,176 +1,357 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Optional, Callable, Awaitable
+import os
+from datetime import datetime
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from telethon import TelegramClient, events
-from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.functions.messages import GetHistoryRequest
-from telethon.tl.types import Message, Channel, User
-from telethon.errors import ChannelPrivateError, ChatAdminRequiredError
+from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
+from telethon.tl.types import Channel
 
-from config import TELEGRAM_API_ID, TELEGRAM_API_HASH, SESSION_NAME
+from config import (
+    TELEGRAM_API_HASH,
+    TELEGRAM_API_ID,
+    TELEGRAM_SESSION_NAME,
+)
 from db import (
+    get_post,
     get_user_channels,
-    update_channel_last_message,
     save_post,
-    get_post
+    update_channel_last_message,
 )
 
-logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 
-class TelegramUserClient:
-    def __init__(self, user_id: int):
-        self.user_id = user_id
-        self.client = TelegramClient(
-            f"{SESSION_NAME}_{user_id}",  # отдельная сессия на пользователя
-            TELEGRAM_API_ID,
-            TELEGRAM_API_HASH
-        )
-        self._running = False
-        self._poll_task = None
-        self._on_new_post_callback: Optional[Callable[[int, int, int, str, datetime], Awaitable[None]]] = None
+PostCallback = Callable[
+    [Dict[str, Any]],
+    Awaitable[None],
+]
 
-    async def start(self):
-        """Авторизация и запуск клиента."""
-        await self.client.start()
+
+class TelegramUserClient:
+    def __init__(
+        self,
+        user_id: int,
+    ):
+        if not TELEGRAM_API_ID:
+            raise RuntimeError(
+                "TELEGRAM_API_ID is not configured"
+            )
+
+        if not TELEGRAM_API_HASH:
+            raise RuntimeError(
+                "TELEGRAM_API_HASH is not configured"
+            )
+
+        self.user_id = user_id
+
+        session_dir = "sessions"
+        os.makedirs(session_dir, exist_ok=True)
+
+        session_path = os.path.join(
+            session_dir,
+            f"{TELEGRAM_SESSION_NAME}_{user_id}",
+        )
+
+        self.client = TelegramClient(
+            session_path,
+            TELEGRAM_API_ID,
+            TELEGRAM_API_HASH,
+        )
+
+        self._post_callback: Optional[PostCallback] = None
+        self._polling = False
+
+    def set_new_post_callback(
+        self,
+        callback: PostCallback,
+    ):
+        self._post_callback = callback
+
+    async def start(self) -> bool:
+        await self.client.connect()
+
+        authorized = await self.client.is_user_authorized()
+
+        if not authorized:
+            logger.warning(
+                "Telegram session is not authorized for user %s",
+                self.user_id,
+            )
+            return False
+
         me = await self.client.get_me()
-        logger.info(f"Telethon клиент авторизован как {me.first_name} (ID: {me.id})")
-        return me
+
+        logger.info(
+            "Telegram client started for user %s: %s",
+            self.user_id,
+            getattr(me, "username", None),
+        )
+
+        return True
 
     async def stop(self):
-        """Остановка клиента и опроса."""
-        self._running = False
-        if self._poll_task:
-            self._poll_task.cancel()
-        await self.client.disconnect()
+        self._polling = False
 
-    def set_new_post_callback(self, callback: Callable[[int, int, int, str, datetime], Awaitable[None]]):
-        """Устанавливает функцию, которая будет вызвана при обнаружении нового поста."""
-        self._on_new_post_callback = callback
+        if self.client.is_connected():
+            await self.client.disconnect()
 
-    async def check_channel_access(self, channel_identifier: str) -> Optional[dict]:
-        """
-        Проверяет, имеет ли пользователь доступ к каналу (подписан).
-        Возвращает информацию о канале: {id, username, title} или None, если нет доступа.
-        """
+    async def is_authorized(self) -> bool:
+        if not self.client.is_connected():
+            await self.client.connect()
+
+        return await self.client.is_user_authorized()
+
+    async def send_code(
+        self,
+        phone: str,
+    ):
+        if not self.client.is_connected():
+            await self.client.connect()
+
+        return await self.client.send_code_request(phone)
+
+    async def sign_in(
+        self,
+        phone: str,
+        code: str,
+        phone_code_hash: str,
+    ) -> str:
+        if not self.client.is_connected():
+            await self.client.connect()
+
         try:
-            entity = await self.client.get_entity(channel_identifier)
-            if not isinstance(entity, Channel):
-                logger.warning(f"'{channel_identifier}' не является каналом")
-                return None
+            await self.client.sign_in(
+                phone=phone,
+                code=code,
+                phone_code_hash=phone_code_hash,
+            )
+        except SessionPasswordNeededError:
+            return "password"
 
-            # Проверяем, подписан ли пользователь
-            try:
-                full_channel = await self.client(GetFullChannelRequest(channel=entity))
-                # Если мы здесь, значит канал доступен
-                return {
-                    "id": entity.id,
-                    "username": f"@{entity.username}" if entity.username else None,
-                    "title": entity.title
-                }
-            except (ChannelPrivateError, ChatAdminRequiredError):
-                logger.warning(f"Нет доступа к каналу {entity.title} (не подписан)")
-                return None
-        except Exception as e:
-            logger.error(f"Ошибка при проверке канала {channel_identifier}: {e}")
+        return "authorized"
+
+    async def sign_in_password(
+        self,
+        password: str,
+    ) -> str:
+        if not self.client.is_connected():
+            await self.client.connect()
+
+        await self.client.sign_in(
+            password=password,
+        )
+
+        return "authorized"
+
+    async def check_channel_access(
+        self,
+        channel_input: str,
+    ) -> Optional[Channel]:
+        if not await self.is_authorized():
             return None
 
-    async def _fetch_new_messages(self, channel_id: int, last_message_id: int) -> list:
-        """
-        Запрашивает новые сообщения из канала, начиная с last_message_id.
-        Возвращает список сообщений (от старых к новым).
-        """
         try:
-            entity = await self.client.get_entity(channel_id)
-            history = await self.client(GetHistoryRequest(
-                peer=entity,
-                limit=100,  # можно увеличить, но обычно 100 хватает на один цикл
-                offset_id=last_message_id,
-                offset_date=None,
-                add_offset=0,
-                max_id=0,
-                min_id=last_message_id + 1,
-                hash=0
-            ))
-            # Сообщения возвращаются от новых к старым, переворачиваем
-            messages = list(reversed(history.messages))
-            return messages
-        except Exception as e:
-            logger.error(f"Ошибка при получении сообщений из канала {channel_id}: {e}")
-            return []
+            entity = await self.client.get_entity(
+                channel_input
+            )
+
+            if not isinstance(entity, Channel):
+                return None
+
+            return entity
+
+        except Exception:
+            logger.exception(
+                "Failed to access channel %s for user %s",
+                channel_input,
+                self.user_id,
+            )
+            return None
+
+    async def _fetch_new_messages(
+        self,
+        channel: Dict[str, Any],
+    ) -> List[Any]:
+        channel_id = int(channel["channel_id"])
+        last_message_id = int(
+            channel.get("last_message_id") or 0
+        )
+
+        entity = await self.client.get_entity(
+            channel_id
+        )
+
+        messages = await self.client.get_messages(
+            entity,
+            limit=100,
+            min_id=last_message_id,
+        )
+
+        messages = [
+            message
+            for message in messages
+            if message.id > last_message_id
+        ]
+
+        messages.sort(
+            key=lambda message: message.id
+        )
+
+        return messages
+
+    async def _process_message(
+        self,
+        channel: Dict[str, Any],
+        message: Any,
+    ) -> bool:
+        channel_id = int(channel["channel_id"])
+
+        existing_post = await get_post(
+            user_id=self.user_id,
+            channel_id=channel_id,
+            message_id=message.id,
+        )
+
+        if existing_post is not None:
+            return True
+
+        text = message.message or ""
+
+        posted_at: Optional[datetime] = getattr(
+            message,
+            "date",
+            None,
+        )
+
+        has_media = bool(
+            getattr(message, "media", None)
+        )
+
+        await save_post(
+            user_id=self.user_id,
+            channel_id=channel_id,
+            message_id=message.id,
+            text=text,
+            posted_at=posted_at,
+            channel_username=channel.get(
+                "channel_username"
+            ),
+            channel_title=channel.get(
+                "channel_title"
+            ),
+            has_media=has_media,
+        )
+
+        if self._post_callback:
+            post_data = {
+                "user_id": self.user_id,
+                "channel_id": channel_id,
+                "channel_username": channel.get(
+                    "channel_username"
+                ),
+                "channel_title": channel.get(
+                    "channel_title"
+                ),
+                "message_id": message.id,
+                "text": text,
+                "posted_at": posted_at,
+                "has_media": has_media,
+            }
+
+            await self._post_callback(post_data)
+
+        return True
+
+    async def _poll_channel(
+        self,
+        channel: Dict[str, Any],
+    ):
+        channel_id = int(channel["channel_id"])
+
+        try:
+            entity = await self.client.get_entity(
+                channel_id
+            )
+
+            if not isinstance(entity, Channel):
+                return
+
+            messages = await self._fetch_new_messages(
+                channel
+            )
+
+            if not messages:
+                return
+
+            for message in messages:
+                success = await self._process_message(
+                    channel,
+                    message,
+                )
+
+                if not success:
+                    break
+
+                await update_channel_last_message(
+                    user_id=self.user_id,
+                    channel_id=channel_id,
+                    last_message_id=message.id,
+                    last_post_at=getattr(
+                        message,
+                        "date",
+                        None,
+                    ),
+                )
+
+        except Exception:
+            logger.exception(
+                "Failed to poll channel %s for user %s",
+                channel_id,
+                self.user_id,
+            )
 
     async def _poll_channels(self):
-        """Периодически опрашивает все активные каналы пользователя."""
-        self._running = True
-        while self._running:
-            try:
-                # Получаем список активных каналов пользователя
-                channels = await get_user_channels(self.user_id)
-                active_channels = [ch for ch in channels if ch.get("enabled", True)]
+        channels = await get_user_channels(
+            user_id=self.user_id,
+            enabled_only=True,
+        )
 
-                for channel in active_channels:
-                    channel_id = channel["channel_id"]
-                    last_msg_id = channel.get("last_message_id", 0)
+        for channel in channels:
+            await self._poll_channel(channel)
 
-                    messages = await self._fetch_new_messages(channel_id, last_msg_id)
-                    if messages:
-                        # Обновляем last_message_id на ID последнего полученного сообщения
-                        new_last_id = messages[-1].id
-                        await update_channel_last_message(
-                            self.user_id,
-                            channel_id,
-                            new_last_id,
-                            datetime.utcnow()
-                        )
+    async def start_polling(
+        self,
+        interval: int = 30,
+    ):
+        if not await self.start():
+            return
 
-                        # Обрабатываем каждое новое сообщение
-                        for msg in messages:
-                            if msg.text and self._on_new_post_callback:
-                                # Проверяем, не сохраняли ли уже этот пост
-                                existing = await get_post(self.user_id, channel_id, msg.id)
-                                if not existing:
-                                    # Сохраняем пост в БД
-                                    await save_post(
-                                        self.user_id,
-                                        channel_id,
-                                        msg.id,
-                                        msg.text,
-                                        msg.date.replace(tzinfo=None)  # делаем naive для MongoDB
-                                    )
-                                    # Вызываем колбэк для обработки поста
-                                    await self._on_new_post_callback(
-                                        self.user_id,
-                                        channel_id,
-                                        msg.id,
-                                        msg.text,
-                                        msg.date.replace(tzinfo=None)
-                                    )
+        self._polling = True
 
-                # Ждём перед следующим опросом
-                await asyncio.sleep(30)  # интервал опроса (можно вынести в настройки)
+        try:
+            while self._polling:
+                await self._poll_channels()
+                await asyncio.sleep(interval)
 
-            except asyncio.CancelledError:
-                logger.info("Опрос каналов остановлен")
-                break
-            except Exception as e:
-                logger.error(f"Ошибка в цикле опроса: {e}")
-                await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
 
-    async def start_polling(self):
-        """Запускает фоновую задачу опроса каналов."""
-        if self._poll_task is None or self._poll_task.done():
-            self._poll_task = asyncio.create_task(self._poll_channels())
-            logger.info("Запущен опрос каналов")
+        except Exception:
+            logger.exception(
+                "Telegram polling stopped for user %s",
+                self.user_id,
+            )
 
-    async def stop_polling(self):
-        """Останавливает опрос каналов."""
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
-            self._poll_task = None
+        finally:
+            self._polling = False
+
+    async def run(self):
+        authorized = await self.start()
+
+        if not authorized:
+            return
+
+        await self.start_polling()
