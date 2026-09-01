@@ -1,0 +1,32 @@
+# Виртуальное окружение
+venv/
+env/
+.venv/
+.env
+
+# Файлы сессий Telethon
+*.session
+*.session-journal
+
+# Файлы IDE
+.vscode/
+.idea/
+*.iml
+
+# Логи и временные файлы
+*.log
+*.tmp
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# База данных (если локальная)
+*.db
+
+# Файлы конфигурации с секретами
+config.local.py
+.env.local
+
+# Системные файлы
+.DS_Store
+Thumbs.db
