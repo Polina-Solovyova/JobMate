@@ -19,7 +19,7 @@ from db import (
     get_user_filters,
     mark_post_processed,
 )
-from filters import (
+from handlers.filters import (
     add_filter_callback,
     cancel_filter_callback,
     filter_action_callback,
@@ -42,6 +42,7 @@ from notifications import send_vacancy_notification
 from telegram_client import TelegramUserClient
 from telegram_clients import (
     get_telegram_client,
+    set_new_post_callback,
     start_user_polling,
     stop_all_clients,
 )
@@ -49,7 +50,12 @@ from vacancies import process_post_with_filters
 
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format=(
+        "%(asctime)s - "
+        "%(name)s - "
+        "%(levelname)s - "
+        "%(message)s"
+    ),
     level=logging.INFO,
 )
 
@@ -67,6 +73,9 @@ async def start_command(
 ):
     user = update.effective_user
 
+    if not user or not update.message:
+        return
+
     await create_user(
         user_id=user.id,
         username=user.username,
@@ -77,7 +86,11 @@ async def start_command(
     )
 
     if await client.is_authorized():
-        await start_user_polling(user.id)
+        setup_user_client_callback(client)
+
+        await start_user_polling(
+            user.id
+        )
 
         await update.message.reply_text(
             "Telegram-аккаунт подключён.",
@@ -97,6 +110,9 @@ async def connect_command(
 ):
     user = update.effective_user
 
+    if not user or not update.message:
+        return ConversationHandler.END
+
     await create_user(
         user_id=user.id,
         username=user.username,
@@ -107,7 +123,11 @@ async def connect_command(
     )
 
     if await client.is_authorized():
-        await start_user_polling(user.id)
+        setup_user_client_callback(client)
+
+        await start_user_polling(
+            user.id
+        )
 
         await update.message.reply_text(
             "Telegram-аккаунт уже подключён.",
@@ -138,7 +158,11 @@ async def auth_phone(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not update.message or not update.message.text:
+    if (
+        not update.message
+        or not update.message.text
+        or not update.effective_user
+    ):
         return AUTH_PHONE
 
     user_id = update.effective_user.id
@@ -174,7 +198,8 @@ async def auth_phone(
 
         await update.message.reply_text(
             "Не удалось отправить код. "
-            "Проверьте номер телефона и попробуйте ещё раз."
+            "Проверьте номер телефона "
+            "и попробуйте ещё раз."
         )
 
         return AUTH_PHONE
@@ -184,7 +209,11 @@ async def auth_code(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not update.message or not update.message.text:
+    if (
+        not update.message
+        or not update.message.text
+        or not update.effective_user
+    ):
         return AUTH_CODE
 
     user_id = update.effective_user.id
@@ -218,8 +247,8 @@ async def auth_code(
 
         if result == "password":
             await update.message.reply_text(
-                "Для аккаунта включена двухфакторная "
-                "аутентификация.\n\n"
+                "Для аккаунта включена "
+                "двухфакторная аутентификация.\n\n"
                 "Введите пароль Telegram."
             )
 
@@ -233,6 +262,8 @@ async def auth_code(
             "phone_code_hash",
             None,
         )
+
+        setup_user_client_callback(client)
 
         await start_user_polling(
             user_id
@@ -264,7 +295,11 @@ async def auth_password(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not update.message or not update.message.text:
+    if (
+        not update.message
+        or not update.message.text
+        or not update.effective_user
+    ):
         return AUTH_PASSWORD
 
     user_id = update.effective_user.id
@@ -288,6 +323,8 @@ async def auth_password(
             None,
         )
 
+        setup_user_client_callback(client)
+
         await start_user_polling(
             user_id
         )
@@ -307,8 +344,9 @@ async def auth_password(
         )
 
         await update.message.reply_text(
-            "Неверный пароль или не удалось завершить "
-            "авторизацию. Попробуйте ещё раз."
+            "Неверный пароль или не удалось "
+            "завершить авторизацию. "
+            "Попробуйте ещё раз."
         )
 
         return AUTH_PASSWORD
@@ -327,9 +365,10 @@ async def cancel_auth(
         None,
     )
 
-    await update.message.reply_text(
-        "Подключение отменено."
-    )
+    if update.message:
+        await update.message.reply_text(
+            "Подключение отменено."
+        )
 
     return ConversationHandler.END
 
@@ -337,10 +376,12 @@ async def cancel_auth(
 async def post_processor(
     post: dict,
 ):
-    user_id = post["user_id"]
+    user_id = int(post["user_id"])
+
     channel_id = int(
         post["channel_id"]
     )
+
     message_id = int(
         post["message_id"]
     )
@@ -348,9 +389,14 @@ async def post_processor(
     text = post.get("text") or ""
 
     try:
-        result = await process_post_with_filters(
-            text=text,
+        user_filters = await get_user_filters(
             user_id=user_id,
+            enabled_only=True,
+        )
+
+        result = process_post_with_filters(
+            post_text=text,
+            filters=user_filters,
         )
 
         is_vacancy = result.get(
@@ -392,9 +438,11 @@ async def post_processor(
         post_link = None
 
         if channel_username:
+            username = channel_username.lstrip("@")
+
             post_link = (
                 f"https://t.me/"
-                f"{channel_username.lstrip('@')}/"
+                f"{username}/"
                 f"{message_id}"
             )
 
@@ -498,10 +546,6 @@ def build_filter_conversation():
                 add_filter_callback,
                 pattern=r"^add_filter$",
             ),
-            CallbackQueryHandler(
-                filter_action_callback,
-                pattern=r"^edit_filter_",
-            ),
         ],
         states={
             1: [
@@ -532,16 +576,66 @@ def build_filter_conversation():
     )
 
 
-async def post_init(
-    application: Application,
-):
+async def post_init(application: Application):
     await create_indexes()
+
+    set_new_post_callback(
+        post_processor
+    )
+
+    await initialize_authorized_clients()
 
 
 async def post_shutdown(
     application: Application,
 ):
     await stop_all_clients()
+
+
+def setup_user_client_callback(
+    client: TelegramUserClient,
+):
+    client.set_new_post_callback(
+        post_processor
+    )
+
+
+async def initialize_authorized_clients():
+    users = await _get_authorized_users()
+
+    for user in users:
+        user_id = user["user_id"]
+
+        try:
+            client = await get_telegram_client(
+                user_id
+            )
+
+            if not await client.is_authorized():
+                continue
+
+            setup_user_client_callback(
+                client
+            )
+
+            await start_user_polling(
+                user_id
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to initialize Telegram "
+                "client for user %s",
+                user_id,
+            )
+
+
+async def _get_authorized_users():
+    from db import users_col
+
+    return await users_col.find(
+        {}
+    ).to_list(length=None)
 
 
 def build_application() -> Application:
@@ -625,8 +719,7 @@ def build_application() -> Application:
             pattern=(
                 r"^(toggle_filter_|"
                 r"delete_filter_|"
-                r"confirm_delete_|"
-                r"edit_filter_)"
+                r"confirm_delete_)"
             ),
         )
     )
@@ -636,49 +729,6 @@ def build_application() -> Application:
     ] = post_processor
 
     return application
-
-
-def setup_user_client_callback(
-    client: TelegramUserClient,
-):
-    client.set_new_post_callback(
-        post_processor
-    )
-
-
-async def initialize_authorized_clients():
-    users = await _get_authorized_users()
-
-    for user in users:
-        user_id = user["user_id"]
-
-        try:
-            client = await get_telegram_client(
-                user_id
-            )
-
-            setup_user_client_callback(
-                client
-            )
-
-            await start_user_polling(
-                user_id
-            )
-
-        except Exception:
-            logger.exception(
-                "Failed to initialize Telegram "
-                "client for user %s",
-                user_id,
-            )
-
-
-async def _get_authorized_users():
-    from db import users_col
-
-    return await users_col.find(
-        {}
-    ).to_list(length=None)
 
 
 def main():

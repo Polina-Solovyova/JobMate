@@ -6,8 +6,10 @@ from telegram.ext import ContextTypes, ConversationHandler
 from db import (
     add_user_channel,
     delete_channel,
+    get_user_channel,
     get_user_channels,
     toggle_channel,
+    update_user_channel,
 )
 from keyboards import (
     channels_list_keyboard,
@@ -21,9 +23,7 @@ logger = logging.getLogger(__name__)
 WAITING_CHANNEL = 1
 
 
-def normalize_channel_input(
-    value: str,
-) -> str:
+def normalize_channel_input(value: str) -> str:
     value = value.strip()
 
     prefixes = (
@@ -34,17 +34,20 @@ def normalize_channel_input(
     )
 
     for prefix in prefixes:
-        if value.startswith(prefix):
+        if value.lower().startswith(prefix):
             value = value[len(prefix):]
             break
 
-    value = value.strip("/")
+    value = value.strip().strip("/")
 
-    if value.startswith("@"):
-        return value
+    if value.startswith("t.me/"):
+        value = value[5:].strip("/")
 
-    if "/" not in value and value:
-        return f"@{value}"
+    if "/" in value:
+        value = value.split("/", 1)[0]
+
+    if value and not value.startswith("@"):
+        value = f"@{value}"
 
     return value
 
@@ -59,13 +62,14 @@ async def my_channels_callback(
     user_id = update.effective_user.id
 
     channels = await get_user_channels(
-        user_id
+        user_id=user_id,
     )
 
-    text = "Ваши каналы:"
-
-    if not channels:
-        text = "У вас пока нет добавленных каналов."
+    text = (
+        "Ваши каналы:"
+        if channels
+        else "У вас пока нет добавленных каналов."
+    )
 
     await query.edit_message_text(
         text=text,
@@ -91,8 +95,7 @@ async def add_channel_callback(
         "Отправьте username или ссылку на Telegram-канал.\n\n"
         "Например:\n"
         "@vacancies_channel\n"
-        "https://t.me/vacancies_channel",
-        reply_markup=main_menu_keyboard(),
+        "https://t.me/vacancies_channel"
     )
 
     return WAITING_CHANNEL
@@ -138,15 +141,18 @@ async def add_channel_input(
         )
         return WAITING_CHANNEL
 
-    client = await get_telegram_client(user_id)
-
-    if not await client.is_authorized():
-        await update.message.reply_text(
-            "Сначала подключите Telegram-аккаунт командой /connect."
-        )
-        return ConversationHandler.END
+    client = await get_telegram_client(
+        user_id
+    )
 
     try:
+        if not await client.is_authorized():
+            await update.message.reply_text(
+                "Сначала подключите Telegram-аккаунт "
+                "командой /connect."
+            )
+            return ConversationHandler.END
+
         channel = await client.check_channel_access(
             channel_input
         )
@@ -154,11 +160,31 @@ async def add_channel_input(
         if channel is None:
             await update.message.reply_text(
                 "Не удалось получить доступ к этому каналу.\n\n"
-                "Проверьте username, ссылку и доступ Telegram-аккаунта."
+                "Проверьте username, ссылку и наличие подписки "
+                "Telegram-аккаунта."
             )
             return WAITING_CHANNEL
 
         channel_id = int(channel.id)
+
+        existing = await get_user_channel(
+            user_id=user_id,
+            channel_id=channel_id,
+        )
+
+        if existing:
+            channels = await get_user_channels(
+                user_id=user_id,
+            )
+
+            await update.message.reply_text(
+                "Этот канал уже добавлен.",
+                reply_markup=channels_list_keyboard(
+                    channels
+                ),
+            )
+
+            return ConversationHandler.END
 
         channel_username = getattr(
             channel,
@@ -172,20 +198,6 @@ async def add_channel_input(
             None,
         )
 
-        existing_channels = await get_user_channels(
-            user_id
-        )
-
-        for existing in existing_channels:
-            if int(existing.get("channel_id")) == channel_id:
-                await update.message.reply_text(
-                    "Этот канал уже добавлен.",
-                    reply_markup=channels_list_keyboard(
-                        existing_channels
-                    ),
-                )
-                return ConversationHandler.END
-
         await add_user_channel(
             user_id=user_id,
             channel_id=channel_id,
@@ -193,8 +205,37 @@ async def add_channel_input(
             channel_title=channel_title,
         )
 
+        # Не отправляем пользователю старые сообщения.
+        try:
+            messages = await client.client.get_messages(
+                channel,
+                limit=1,
+            )
+
+            if messages:
+                last_message = messages[0]
+
+                from db import update_channel_last_message
+
+                await update_channel_last_message(
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    last_message_id=int(last_message.id),
+                    last_post_at=getattr(
+                        last_message,
+                        "date",
+                        None,
+                    ),
+                )
+
+        except Exception:
+            logger.exception(
+                "Failed to initialize channel cursor %s",
+                channel_id,
+            )
+
         channels = await get_user_channels(
-            user_id
+            user_id=user_id,
         )
 
         await update.message.reply_text(
@@ -220,6 +261,21 @@ async def add_channel_input(
         return WAITING_CHANNEL
 
 
+async def _get_channel_by_document_id(
+    user_id: int,
+    document_id: str,
+):
+    channels = await get_user_channels(
+        user_id=user_id,
+    )
+
+    for channel in channels:
+        if str(channel.get("_id")) == str(document_id):
+            return channel, channels
+
+    return None, channels
+
+
 async def toggle_channel_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -228,22 +284,17 @@ async def toggle_channel_callback(
     await query.answer()
 
     user_id = update.effective_user.id
-    channel_id = query.data.removeprefix(
+
+    document_id = (
+        query.data or ""
+    ).removeprefix(
         "toggle_channel_"
     )
 
     try:
-        channels = await get_user_channels(
-            user_id
-        )
-
-        channel = next(
-            (
-                item
-                for item in channels
-                if str(item.get("_id")) == channel_id
-            ),
-            None,
+        channel, channels = await _get_channel_by_document_id(
+            user_id,
+            document_id,
         )
 
         if channel is None:
@@ -255,16 +306,13 @@ async def toggle_channel_callback(
             )
             return
 
-        enabled = not channel.get(
-            "enabled",
-            True,
+        enabled = not bool(
+            channel.get("enabled", True)
         )
 
         updated = await toggle_channel(
             user_id=user_id,
-            channel_id=int(
-                channel["channel_id"]
-            ),
+            channel_id=int(channel["channel_id"]),
             enabled=enabled,
         )
 
@@ -278,11 +326,13 @@ async def toggle_channel_callback(
             return
 
         channels = await get_user_channels(
-            user_id
+            user_id=user_id,
         )
 
         await query.edit_message_text(
-            "Состояние канала изменено.",
+            "Канал включён."
+            if enabled
+            else "Канал выключен.",
             reply_markup=channels_list_keyboard(
                 channels
             ),
@@ -291,7 +341,7 @@ async def toggle_channel_callback(
     except Exception:
         logger.exception(
             "Failed to toggle channel %s for user %s",
-            channel_id,
+            document_id,
             user_id,
         )
 
@@ -308,22 +358,17 @@ async def delete_channel_callback(
     await query.answer()
 
     user_id = update.effective_user.id
-    channel_id = query.data.removeprefix(
+
+    document_id = (
+        query.data or ""
+    ).removeprefix(
         "delete_channel_"
     )
 
     try:
-        channels = await get_user_channels(
-            user_id
-        )
-
-        channel = next(
-            (
-                item
-                for item in channels
-                if str(item.get("_id")) == channel_id
-            ),
-            None,
+        channel, channels = await _get_channel_by_document_id(
+            user_id,
+            document_id,
         )
 
         if channel is None:
@@ -337,26 +382,17 @@ async def delete_channel_callback(
 
         deleted = await delete_channel(
             user_id=user_id,
-            channel_id=int(
-                channel["channel_id"]
-            ),
+            channel_id=int(channel["channel_id"]),
         )
 
         channels = await get_user_channels(
-            user_id
+            user_id=user_id,
         )
 
-        if not deleted:
-            await query.edit_message_text(
-                "Канал не найден или уже удалён.",
-                reply_markup=channels_list_keyboard(
-                    channels
-                ),
-            )
-            return
-
         await query.edit_message_text(
-            "Канал удалён.",
+            "Канал удалён."
+            if deleted
+            else "Канал не найден или уже удалён.",
             reply_markup=channels_list_keyboard(
                 channels
             ),
@@ -365,7 +401,7 @@ async def delete_channel_callback(
     except Exception:
         logger.exception(
             "Failed to delete channel %s for user %s",
-            channel_id,
+            document_id,
             user_id,
         )
 
@@ -383,32 +419,16 @@ async def retry_channel_callback(
 
     user_id = update.effective_user.id
 
-    channel_id = query.data.removeprefix(
+    document_id = (
+        query.data or ""
+    ).removeprefix(
         "retry_channel_"
     )
 
-    client = await get_telegram_client(
-        user_id
-    )
-
-    if not await client.is_authorized():
-        await query.edit_message_text(
-            "Сначала подключите Telegram-аккаунт командой /connect."
-        )
-        return
-
     try:
-        channels = await get_user_channels(
-            user_id
-        )
-
-        channel = next(
-            (
-                item
-                for item in channels
-                if str(item.get("_id")) == channel_id
-            ),
-            None,
+        channel, channels = await _get_channel_by_document_id(
+            user_id,
+            document_id,
         )
 
         if channel is None:
@@ -420,22 +440,24 @@ async def retry_channel_callback(
             )
             return
 
-        username = channel.get(
-            "channel_username"
+        client = await get_telegram_client(
+            user_id
         )
 
-        if not username:
+        if not await client.is_authorized():
             await query.edit_message_text(
-                "У канала отсутствует username, поэтому "
-                "проверить доступ автоматически не удалось.",
-                reply_markup=channels_list_keyboard(
-                    channels
-                ),
+                "Сначала подключите Telegram-аккаунт "
+                "командой /connect."
             )
             return
 
+        identifier = (
+            channel.get("channel_username")
+            or channel.get("channel_id")
+        )
+
         access = await client.check_channel_access(
-            username
+            str(identifier)
         )
 
         if access is None:
@@ -447,6 +469,27 @@ async def retry_channel_callback(
             )
             return
 
+        await update_user_channel(
+            user_id=user_id,
+            channel_id=int(channel["channel_id"]),
+            updates={
+                "channel_username": getattr(
+                    access,
+                    "username",
+                    None,
+                ),
+                "channel_title": getattr(
+                    access,
+                    "title",
+                    None,
+                ),
+            },
+        )
+
+        channels = await get_user_channels(
+            user_id=user_id,
+        )
+
         await query.edit_message_text(
             "Доступ к каналу восстановлен.",
             reply_markup=channels_list_keyboard(
@@ -457,7 +500,7 @@ async def retry_channel_callback(
     except Exception:
         logger.exception(
             "Failed to retry channel %s for user %s",
-            channel_id,
+            document_id,
             user_id,
         )
 

@@ -48,7 +48,10 @@ class TelegramUserClient:
         self.user_id = user_id
 
         session_dir = "sessions"
-        os.makedirs(session_dir, exist_ok=True)
+        os.makedirs(
+            session_dir,
+            exist_ok=True,
+        )
 
         session_path = os.path.join(
             session_dir,
@@ -67,11 +70,12 @@ class TelegramUserClient:
     def set_new_post_callback(
         self,
         callback: PostCallback,
-    ):
+    ) -> None:
         self._post_callback = callback
 
     async def start(self) -> bool:
-        await self.client.connect()
+        if not self.client.is_connected():
+            await self.client.connect()
 
         authorized = await self.client.is_user_authorized()
 
@@ -92,7 +96,7 @@ class TelegramUserClient:
 
         return True
 
-    async def stop(self):
+    async def stop(self) -> None:
         self._polling = False
 
         if self.client.is_connected():
@@ -111,7 +115,9 @@ class TelegramUserClient:
         if not self.client.is_connected():
             await self.client.connect()
 
-        return await self.client.send_code_request(phone)
+        return await self.client.send_code_request(
+            phone
+        )
 
     async def sign_in(
         self,
@@ -128,6 +134,7 @@ class TelegramUserClient:
                 code=code,
                 phone_code_hash=phone_code_hash,
             )
+
         except SessionPasswordNeededError:
             return "password"
 
@@ -174,8 +181,12 @@ class TelegramUserClient:
     async def _fetch_new_messages(
         self,
         channel: Dict[str, Any],
+        page_size: int = 100,
     ) -> List[Any]:
-        channel_id = int(channel["channel_id"])
+        channel_id = int(
+            channel["channel_id"]
+        )
+
         last_message_id = int(
             channel.get("last_message_id") or 0
         )
@@ -184,41 +195,81 @@ class TelegramUserClient:
             channel_id
         )
 
-        messages = await self.client.get_messages(
-            entity,
-            limit=100,
-            min_id=last_message_id,
+        all_messages: List[Any] = []
+
+        offset_id = 0
+
+        while True:
+            messages = await self.client.get_messages(
+                entity,
+                limit=page_size,
+                min_id=last_message_id,
+                offset_id=offset_id,
+            )
+
+            if not messages:
+                break
+
+            page = [
+                message
+                for message in messages
+                if int(message.id) > last_message_id
+            ]
+
+            all_messages.extend(page)
+
+            if len(messages) < page_size:
+                break
+
+            new_offset = min(
+                int(message.id)
+                for message in messages
+            )
+
+            if new_offset <= 0 or new_offset == offset_id:
+                break
+
+            offset_id = new_offset
+
+        unique_messages = {
+            int(message.id): message
+            for message in all_messages
+        }
+
+        result = list(
+            unique_messages.values()
         )
 
-        messages = [
-            message
-            for message in messages
-            if message.id > last_message_id
-        ]
-
-        messages.sort(
-            key=lambda message: message.id
+        result.sort(
+            key=lambda message: int(message.id)
         )
 
-        return messages
+        return result
 
     async def _process_message(
         self,
         channel: Dict[str, Any],
         message: Any,
     ) -> bool:
-        channel_id = int(channel["channel_id"])
+        channel_id = int(
+            channel["channel_id"]
+        )
+
+        message_id = int(
+            message.id
+        )
 
         existing_post = await get_post(
             user_id=self.user_id,
             channel_id=channel_id,
-            message_id=message.id,
+            message_id=message_id,
         )
 
-        if existing_post is not None:
-            return True
-
-        text = message.message or ""
+        text = getattr(
+            message,
+            "message",
+            None,
+        ) or ""
 
         posted_at: Optional[datetime] = getattr(
             message,
@@ -230,46 +281,64 @@ class TelegramUserClient:
             getattr(message, "media", None)
         )
 
-        await save_post(
-            user_id=self.user_id,
-            channel_id=channel_id,
-            message_id=message.id,
-            text=text,
-            posted_at=posted_at,
-            channel_username=channel.get(
-                "channel_username"
-            ),
-            channel_title=channel.get(
-                "channel_title"
-            ),
-            has_media=has_media,
-        )
-
-        if self._post_callback:
-            post_data = {
-                "user_id": self.user_id,
-                "channel_id": channel_id,
-                "channel_username": channel.get(
+        if existing_post is None:
+            await save_post(
+                user_id=self.user_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                text=text,
+                posted_at=posted_at,
+                channel_username=channel.get(
                     "channel_username"
                 ),
-                "channel_title": channel.get(
+                channel_title=channel.get(
                     "channel_title"
                 ),
-                "message_id": message.id,
-                "text": text,
-                "posted_at": posted_at,
-                "has_media": has_media,
-            }
+                has_media=has_media,
+            )
 
-            await self._post_callback(post_data)
+        # Если пост уже processed, повторно его не обрабатываем.
+        if existing_post and existing_post.get(
+            "processed"
+        ):
+            return True
+
+        if self._post_callback is None:
+            logger.warning(
+                "Post callback is not configured "
+                "for user %s",
+                self.user_id,
+            )
+            return False
+
+        post_data = {
+            "user_id": self.user_id,
+            "channel_id": channel_id,
+            "channel_username": channel.get(
+                "channel_username"
+            ),
+            "channel_title": channel.get(
+                "channel_title"
+            ),
+            "message_id": message_id,
+            "text": text,
+            "posted_at": posted_at,
+            "has_media": has_media,
+        }
+
+        await self._post_callback(
+            post_data
+        )
 
         return True
 
     async def _poll_channel(
         self,
         channel: Dict[str, Any],
-    ):
-        channel_id = int(channel["channel_id"])
+    ) -> None:
+        channel_id = int(
+            channel["channel_id"]
+        )
 
         try:
             entity = await self.client.get_entity(
@@ -293,12 +362,17 @@ class TelegramUserClient:
                 )
 
                 if not success:
+                    logger.warning(
+                        "Stopping channel processing after "
+                        "failed message %s",
+                        message.id,
+                    )
                     break
 
                 await update_channel_last_message(
                     user_id=self.user_id,
                     channel_id=channel_id,
-                    last_message_id=message.id,
+                    last_message_id=int(message.id),
                     last_post_at=getattr(
                         message,
                         "date",
@@ -313,19 +387,24 @@ class TelegramUserClient:
                 self.user_id,
             )
 
-    async def _poll_channels(self):
+    async def _poll_channels(self) -> None:
         channels = await get_user_channels(
             user_id=self.user_id,
             enabled_only=True,
         )
 
         for channel in channels:
-            await self._poll_channel(channel)
+            if not self._polling:
+                break
+
+            await self._poll_channel(
+                channel
+            )
 
     async def start_polling(
         self,
         interval: int = 30,
-    ):
+    ) -> None:
         if not await self.start():
             return
 
@@ -334,7 +413,11 @@ class TelegramUserClient:
         try:
             while self._polling:
                 await self._poll_channels()
-                await asyncio.sleep(interval)
+
+                if self._polling:
+                    await asyncio.sleep(
+                        max(1, interval)
+                    )
 
         except asyncio.CancelledError:
             raise
@@ -348,10 +431,8 @@ class TelegramUserClient:
         finally:
             self._polling = False
 
-    async def run(self):
-        authorized = await self.start()
-
-        if not authorized:
+    async def run(self) -> None:
+        if not await self.start():
             return
 
         await self.start_polling()

@@ -1,4 +1,7 @@
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 
 
 def main_menu_keyboard():
@@ -38,7 +41,10 @@ def filters_list_keyboard(filters):
     buttons = []
 
     for filter_data in filters:
-        filter_id = str(filter_data["_id"])
+        filter_id = str(
+            filter_data["_id"]
+        )
+
         name = filter_data.get(
             "name",
             "Без названия",
@@ -55,7 +61,9 @@ def filters_list_keyboard(filters):
             [
                 InlineKeyboardButton(
                     f"{status} {name}",
-                    callback_data=f"filter_{filter_id}",
+                    callback_data=(
+                        f"filter_{filter_id}"
+                    ),
                 )
             ]
         )
@@ -148,20 +156,72 @@ def filter_actions_keyboard(
     )
 
 
+def channel_actions_keyboard(
+    channel_id: int,
+    enabled: bool = True,
+):
+    toggle_text = (
+        "Выключить"
+        if enabled
+        else "Включить"
+    )
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    toggle_text,
+                    callback_data=(
+                        f"toggle_channel_{channel_id}"
+                    ),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Удалить",
+                    callback_data=(
+                        f"delete_channel_{channel_id}"
+                    ),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Повторить подключение",
+                    callback_data=(
+                        f"retry_channel_{channel_id}"
+                    ),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Назад",
+                    callback_data="my_channels",
+                ),
+            ],
+        ]
+    )
+
+
 def channels_list_keyboard(channels):
     buttons = []
 
     for channel in channels:
         channel_id = channel["channel_id"]
-        username = channel.get("username")
-        title = channel.get("title")
 
-        name = (
-            f"@{username}"
-            if username
-            else title
-            or str(channel_id)
+        username = channel.get(
+            "channel_username"
         )
+
+        title = channel.get(
+            "channel_title"
+        )
+
+        if username:
+            name = f"@{username.lstrip('@')}"
+        elif title:
+            name = title
+        else:
+            name = str(channel_id)
 
         enabled = channel.get(
             "enabled",

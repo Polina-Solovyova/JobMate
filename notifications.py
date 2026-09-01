@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 from telegram import Bot
 
@@ -7,15 +8,49 @@ from config import BOT_TOKEN
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_MESSAGE_LIMIT = 4096
+
+
+def _build_post_link(
+    channel_username: Optional[str],
+    message_id: Optional[int],
+) -> Optional[str]:
+    if not channel_username or not message_id:
+        return None
+
+    username = channel_username.lstrip("@").strip()
+
+    if not username:
+        return None
+
+    return (
+        f"https://t.me/{username}/{int(message_id)}"
+    )
+
+
+def _truncate_text(
+    text: str,
+    limit: int = TELEGRAM_MESSAGE_LIMIT,
+) -> str:
+    if len(text) <= limit:
+        return text
+
+    suffix = "\n\n…текст сокращён."
+
+    return (
+        text[: limit - len(suffix)]
+        + suffix
+    )
+
 
 async def send_vacancy_notification(
     user_id: int,
     text: str,
-    channel_title: str | None = None,
-    channel_username: str | None = None,
-    post_link: str | None = None,
-    matched_filters: list[str] | None = None,
-):
+    channel_title: Optional[str] = None,
+    channel_username: Optional[str] = None,
+    post_link: Optional[str] = None,
+    matched_filters: Optional[list[str]] = None,
+) -> None:
     if not BOT_TOKEN:
         raise RuntimeError(
             "BOT_TOKEN is not configured"
@@ -28,6 +63,12 @@ async def send_vacancy_notification(
         or channel_username
         or "Неизвестный канал"
     )
+
+    if post_link is None:
+        post_link = _build_post_link(
+            channel_username=channel_username,
+            message_id=None,
+        )
 
     parts = [
         "Найдена подходящая вакансия.",
@@ -64,9 +105,13 @@ async def send_vacancy_notification(
             ]
         )
 
-    message = "\n".join(parts)
+    message = _truncate_text(
+        "\n".join(parts)
+    )
 
-    bot = Bot(token=BOT_TOKEN)
+    bot = Bot(
+        token=BOT_TOKEN
+    )
 
     try:
         await bot.send_message(

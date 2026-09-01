@@ -58,7 +58,10 @@ async def create_user(
         upsert=True,
     )
 
-    return result.modified_count > 0 or result.upserted_id is not None
+    return (
+        result.modified_count > 0
+        or result.upserted_id is not None
+    )
 
 
 async def get_user(
@@ -68,6 +71,10 @@ async def get_user(
         {"user_id": user_id}
     )
 
+
+# ---------------------------------------------------------------------
+# Channels
+# ---------------------------------------------------------------------
 
 async def add_user_channel(
     user_id: int,
@@ -119,7 +126,10 @@ async def get_user_channels(
 
     return await user_channels_col.find(
         query
-    ).sort("added_at", -1).to_list(length=None)
+    ).sort(
+        "added_at",
+        -1,
+    ).to_list(length=None)
 
 
 async def get_user_channel(
@@ -155,7 +165,7 @@ async def update_user_channel(
         },
     )
 
-    return result.modified_count > 0
+    return result.matched_count > 0
 
 
 async def toggle_user_channel(
@@ -166,9 +176,7 @@ async def toggle_user_channel(
     return await update_user_channel(
         user_id=user_id,
         channel_id=channel_id,
-        updates={
-            "enabled": enabled,
-        },
+        updates={"enabled": enabled},
     )
 
 
@@ -232,8 +240,12 @@ async def update_channel_last_message(
         },
     )
 
-    return result.modified_count > 0
+    return result.matched_count > 0
 
+
+# ---------------------------------------------------------------------
+# Posts
+# ---------------------------------------------------------------------
 
 async def get_post(
     user_id: int,
@@ -285,12 +297,16 @@ async def save_post(
                 "processed_at": None,
                 "is_vacancy": None,
                 "vacancy_data": None,
+                "processing_error": None,
             },
         },
         upsert=True,
     )
 
-    return result.upserted_id is not None
+    return (
+        result.upserted_id is not None
+        or result.modified_count > 0
+    )
 
 
 async def mark_post_processed(
@@ -312,11 +328,35 @@ async def mark_post_processed(
                 "processed_at": utcnow(),
                 "is_vacancy": is_vacancy,
                 "vacancy_data": vacancy_data,
+                "processing_error": None,
             }
         },
     )
 
-    return result.modified_count > 0
+    return result.matched_count > 0
+
+
+async def mark_post_processing_error(
+    user_id: int,
+    channel_id: int,
+    message_id: int,
+    error: str,
+) -> bool:
+    result = await posts_col.update_one(
+        {
+            "user_id": user_id,
+            "channel_id": channel_id,
+            "message_id": message_id,
+        },
+        {
+            "$set": {
+                "processing_error": error[:2000],
+                "updated_at": utcnow(),
+            }
+        },
+    )
+
+    return result.matched_count > 0
 
 
 async def update_post_vacancy_status(
@@ -334,6 +374,10 @@ async def update_post_vacancy_status(
         vacancy_data=vacancy_data,
     )
 
+
+# ---------------------------------------------------------------------
+# Filters
+# ---------------------------------------------------------------------
 
 async def add_filter(
     user_id: int,
@@ -380,7 +424,10 @@ async def get_filters(
 
     return await filters_col.find(
         query
-    ).sort("created_at", -1).to_list(length=None)
+    ).sort(
+        "created_at",
+        -1,
+    ).to_list(length=None)
 
 
 async def get_user_filters(
@@ -433,7 +480,7 @@ async def update_filter(
         },
     )
 
-    return result.modified_count > 0
+    return result.matched_count > 0
 
 
 async def toggle_filter(
@@ -444,9 +491,7 @@ async def toggle_filter(
     return await update_filter(
         user_id=user_id,
         filter_id=filter_id,
-        updates={
-            "enabled": enabled,
-        },
+        updates={"enabled": enabled},
     )
 
 
@@ -469,7 +514,11 @@ async def delete_filter(
     return result.deleted_count > 0
 
 
-async def create_indexes():
+# ---------------------------------------------------------------------
+# Indexes
+# ---------------------------------------------------------------------
+
+async def create_indexes() -> None:
     await users_col.create_index(
         [("user_id", 1)],
         unique=True,
