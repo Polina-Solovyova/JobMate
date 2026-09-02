@@ -26,6 +26,7 @@ from db import (
 )
 
 from handlers.filters import (
+    WAITING_FILTER_EDIT,
     add_filter_callback,
     cancel_filter_callback,
     filter_action_callback,
@@ -45,7 +46,10 @@ from handlers.channels import (
     toggle_channel_callback,
 )
 
+from handlers.settings import settings_callback
+
 from keyboards import main_menu_keyboard
+
 from notifications import send_vacancy_notification
 
 from telegram_client import TelegramUserClient
@@ -75,7 +79,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
-
 
 AUTH_QR = 1
 
@@ -156,8 +159,6 @@ async def connect_command(
 
         return ConversationHandler.END
 
-    # Если предыдущая попытка QR-входа осталась,
-    # отменяем её.
     await cancel_qr_login(
         user_id
     )
@@ -311,11 +312,6 @@ async def send_bot_message(
     chat_id: int,
     text: str,
 ):
-    """
-    Отправляет сообщение через Bot API.
-
-    Используется background-задачей QR авторизации.
-    """
     from telegram import Bot
 
     if not BOT_TOKEN:
@@ -355,6 +351,23 @@ async def cancel_auth(
         )
 
     return ConversationHandler.END
+
+
+async def main_menu_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not query:
+        return
+
+    await query.answer()
+
+    await query.edit_message_text(
+        "Главное меню:",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def post_processor(
@@ -432,13 +445,23 @@ async def post_processor(
                 f"{message_id}"
             )
 
+        matched_filter_names = [
+            item.get(
+                "filter_name",
+                "Без названия",
+            )
+            if isinstance(item, dict)
+            else str(item)
+            for item in matched_filters
+        ]
+
         await send_vacancy_notification(
             user_id=user_id,
             text=text,
             channel_title=channel_title,
             channel_username=channel_username,
             post_link=post_link,
-            matched_filters=matched_filters,
+            matched_filters=matched_filter_names,
         )
 
     except Exception:
@@ -526,6 +549,10 @@ def build_filter_conversation():
                 add_filter_callback,
                 pattern=r"^add_filter$",
             ),
+            CallbackQueryHandler(
+                filter_action_callback,
+                pattern=r"^edit_filter_",
+            ),
         ],
         states={
             1: [
@@ -535,7 +562,7 @@ def build_filter_conversation():
                     filter_input,
                 ),
             ],
-            2: [
+            WAITING_FILTER_EDIT: [
                 MessageHandler(
                     filters.TEXT
                     & ~filters.COMMAND,
@@ -547,6 +574,10 @@ def build_filter_conversation():
             CallbackQueryHandler(
                 cancel_filter_callback,
                 pattern=r"^my_filters$",
+            ),
+            CallbackQueryHandler(
+                cancel_filter_callback,
+                pattern=r"^main_menu$",
             ),
             CommandHandler(
                 "cancel",
@@ -649,6 +680,13 @@ def build_application() -> Application:
 
     application.add_handler(
         CallbackQueryHandler(
+            main_menu_callback,
+            pattern=r"^main_menu$",
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
             my_channels_callback,
             pattern=r"^my_channels$",
         )
@@ -697,6 +735,13 @@ def build_application() -> Application:
                 r"delete_filter_|"
                 r"confirm_delete_)"
             ),
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            settings_callback,
+            pattern=r"^settings$",
         )
     )
 

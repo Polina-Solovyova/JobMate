@@ -480,6 +480,9 @@ def process_post_with_filters(
     """
     Обрабатывает пост и проверяет его по всем активным фильтрам.
 
+    Пользовательский фильтр проверяется независимо от
+    общего классификатора вакансий.
+
     Возвращает:
 
     {
@@ -489,21 +492,19 @@ def process_post_with_filters(
         "filter_results": list,
     }
     """
-    vacancy_data = process_post(post_text)
 
-    if not vacancy_data:
-        return {
-            "is_vacancy": False,
-            "vacancy_data": None,
-            "matched_filters": [],
-            "filter_results": [],
-        }
+    vacancy_data = normalize_vacancy(
+        extract_vacancy(post_text or "")
+    )
 
     filter_results: List[Dict[str, Any]] = []
     matched_filters: List[Dict[str, Any]] = []
 
     for filter_item in filters:
-        if not filter_item.get("enabled", True):
+        if not filter_item.get(
+            "enabled",
+            True,
+        ):
             continue
 
         filter_result = check_vacancy_against_filter(
@@ -513,7 +514,10 @@ def process_post_with_filters(
 
         result = {
             "filter_id": str(
-                filter_item.get("_id", "")
+                filter_item.get(
+                    "_id",
+                    "",
+                )
             ),
             "filter_name": filter_item.get(
                 "name",
@@ -538,14 +542,31 @@ def process_post_with_filters(
             "match_result": filter_result,
         }
 
-        filter_results.append(result)
+        filter_results.append(
+            result
+        )
 
         if result["matched"]:
-            matched_filters.append(result)
+            matched_filters.append(
+                result
+            )
+
+    generic_vacancy = is_vacancy(
+        post_text or ""
+    )
+
+    is_vacancy_result = bool(
+        generic_vacancy
+        or matched_filters
+    )
 
     return {
-        "is_vacancy": True,
-        "vacancy_data": vacancy_data,
+        "is_vacancy": is_vacancy_result,
+        "vacancy_data": (
+            vacancy_data
+            if is_vacancy_result
+            else None
+        ),
         "matched_filters": matched_filters,
         "filter_results": filter_results,
     }

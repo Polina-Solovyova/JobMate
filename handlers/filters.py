@@ -32,7 +32,9 @@ async def my_filters_callback(
 
     await query.edit_message_text(
         "Ваши фильтры:",
-        reply_markup=filters_list_keyboard(filters_data),
+        reply_markup=filters_list_keyboard(
+            filters_data
+        ),
     )
 
 
@@ -43,7 +45,10 @@ async def add_filter_callback(
     query = update.callback_query
     await query.answer()
 
-    context.user_data.pop("editing_filter_id", None)
+    context.user_data.pop(
+        "editing_filter_id",
+        None,
+    )
 
     await query.edit_message_text(
         "Введите описание вакансии для фильтра.\n\n"
@@ -61,7 +66,10 @@ async def cancel_filter_callback(
     query = update.callback_query
     await query.answer()
 
-    context.user_data.pop("editing_filter_id", None)
+    context.user_data.pop(
+        "editing_filter_id",
+        None,
+    )
 
     await query.edit_message_text(
         "Действие отменено.",
@@ -356,7 +364,7 @@ async def filter_action_callback(
         )
 
     else:
-        return
+        return ConversationHandler.END
 
     filter_data = await get_filter(
         user_id=user_id,
@@ -368,7 +376,7 @@ async def filter_action_callback(
             "Фильтр не найден.",
             reply_markup=main_menu_keyboard(),
         )
-        return
+        return ConversationHandler.END
 
     if action == "toggle":
         enabled = not filter_data.get(
@@ -387,7 +395,7 @@ async def filter_action_callback(
                 "Не удалось изменить статус фильтра.",
                 reply_markup=main_menu_keyboard(),
             )
-            return
+            return ConversationHandler.END
 
         await query.edit_message_text(
             "Фильтр включён."
@@ -398,7 +406,8 @@ async def filter_action_callback(
                 enabled=enabled,
             ),
         )
-        return
+
+        return ConversationHandler.END
 
     if action == "delete":
         await query.edit_message_text(
@@ -412,7 +421,7 @@ async def filter_action_callback(
                 confirm_delete=True,
             ),
         )
-        return
+        return ConversationHandler.END
 
     if action == "confirm_delete":
         deleted = await delete_filter(
@@ -431,7 +440,7 @@ async def filter_action_callback(
                 reply_markup=main_menu_keyboard(),
             )
 
-        return
+        return ConversationHandler.END
 
     if action == "edit":
         context.user_data[
@@ -445,3 +454,5 @@ async def filter_action_callback(
         )
 
         return WAITING_FILTER_EDIT
+
+    return ConversationHandler.END
