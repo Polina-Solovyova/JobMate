@@ -1,4 +1,8 @@
+import asyncio
+import io
 import logging
+
+import qrcode
 
 from telegram import Update
 from telegram.ext import (
@@ -13,12 +17,14 @@ from telegram.ext import (
 )
 
 from config import BOT_TOKEN
+
 from db import (
     create_indexes,
     create_user,
     get_user_filters,
     mark_post_processed,
 )
+
 from handlers.filters import (
     add_filter_callback,
     cancel_filter_callback,
@@ -27,6 +33,7 @@ from handlers.filters import (
     filter_input,
     my_filters_callback,
 )
+
 from handlers.channels import (
     WAITING_CHANNEL,
     add_channel_callback,
@@ -37,15 +44,23 @@ from handlers.channels import (
     retry_channel_callback,
     toggle_channel_callback,
 )
+
 from keyboards import main_menu_keyboard
 from notifications import send_vacancy_notification
+
 from telegram_client import TelegramUserClient
+
 from telegram_clients import (
+    cancel_qr_login,
     get_telegram_client,
+    register_qr_task,
     set_new_post_callback,
+    start_qr_login,
     start_user_polling,
     stop_all_clients,
+    wait_qr_login,
 )
+
 from vacancies import process_post_with_filters
 
 
@@ -62,9 +77,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-AUTH_PHONE = 1
-AUTH_CODE = 2
-AUTH_PASSWORD = 3
+AUTH_QR = 1
 
 
 async def start_command(
@@ -86,7 +99,9 @@ async def start_command(
     )
 
     if await client.is_authorized():
-        setup_user_client_callback(client)
+        setup_user_client_callback(
+            client
+        )
 
         await start_user_polling(
             user.id
@@ -96,6 +111,7 @@ async def start_command(
             "Telegram-аккаунт подключён.",
             reply_markup=main_menu_keyboard(),
         )
+
         return
 
     await update.message.reply_text(
@@ -113,20 +129,24 @@ async def connect_command(
     if not user or not update.message:
         return ConversationHandler.END
 
+    user_id = user.id
+
     await create_user(
-        user_id=user.id,
+        user_id=user_id,
         username=user.username,
     )
 
     client = await get_telegram_client(
-        user.id
+        user_id
     )
 
     if await client.is_authorized():
-        setup_user_client_callback(client)
+        setup_user_client_callback(
+            client
+        )
 
         await start_user_polling(
-            user.id
+            user_id
         )
 
         await update.message.reply_text(
@@ -136,234 +156,198 @@ async def connect_command(
 
         return ConversationHandler.END
 
-    context.user_data.pop(
-        "auth_phone",
-        None,
-    )
-    context.user_data.pop(
-        "phone_code_hash",
-        None,
-    )
-
-    await update.message.reply_text(
-        "Введите номер телефона Telegram "
-        "в международном формате.\n\n"
-        "Например: +371XXXXXXXX"
-    )
-
-    return AUTH_PHONE
-
-
-async def auth_phone(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if (
-        not update.message
-        or not update.message.text
-        or not update.effective_user
-    ):
-        return AUTH_PHONE
-
-    user_id = update.effective_user.id
-    phone = update.message.text.strip()
-
-    client = await get_telegram_client(
+    # Если предыдущая попытка QR-входа осталась,
+    # отменяем её.
+    await cancel_qr_login(
         user_id
     )
 
     try:
-        sent_code = await client.send_code(
-            phone
+        qr_login = await start_qr_login(
+            user_id
         )
 
-        context.user_data["auth_phone"] = phone
-        context.user_data["phone_code_hash"] = (
-            sent_code.phone_code_hash
-        )
-
-        await update.message.reply_text(
-            "Код отправлен в Telegram.\n\n"
-            "Введите полученный код."
-        )
-
-        return AUTH_CODE
-
-    except Exception:
-        logger.exception(
-            "Failed to send Telegram code "
-            "for user %s",
-            user_id,
-        )
-
-        await update.message.reply_text(
-            "Не удалось отправить код. "
-            "Проверьте номер телефона "
-            "и попробуйте ещё раз."
-        )
-
-        return AUTH_PHONE
-
-
-async def auth_code(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if (
-        not update.message
-        or not update.message.text
-        or not update.effective_user
-    ):
-        return AUTH_CODE
-
-    user_id = update.effective_user.id
-    code = update.message.text.strip()
-
-    phone = context.user_data.get(
-        "auth_phone"
-    )
-    phone_code_hash = context.user_data.get(
-        "phone_code_hash"
-    )
-
-    if not phone or not phone_code_hash:
-        await update.message.reply_text(
-            "Сессия подключения потеряна. "
-            "Запустите /connect заново."
-        )
-
-        return ConversationHandler.END
-
-    client = await get_telegram_client(
-        user_id
-    )
-
-    try:
-        result = await client.sign_in(
-            phone=phone,
-            code=code,
-            phone_code_hash=phone_code_hash,
-        )
-
-        if result == "password":
+        if qr_login is None:
             await update.message.reply_text(
-                "Для аккаунта включена "
-                "двухфакторная аутентификация.\n\n"
-                "Введите пароль Telegram."
+                "Telegram-аккаунт уже подключён.",
+                reply_markup=main_menu_keyboard(),
             )
 
-            return AUTH_PASSWORD
+            return ConversationHandler.END
 
-        context.user_data.pop(
-            "auth_phone",
-            None,
-        )
-        context.user_data.pop(
-            "phone_code_hash",
-            None,
+        qr_image = qrcode.make(
+            qr_login.url
         )
 
-        setup_user_client_callback(client)
+        image_buffer = io.BytesIO()
 
-        await start_user_polling(
-            user_id
+        qr_image.save(
+            image_buffer,
+            format="PNG",
         )
 
-        await update.message.reply_text(
-            "Telegram-аккаунт успешно подключён.",
-            reply_markup=main_menu_keyboard(),
+        image_buffer.seek(0)
+
+        await update.message.reply_photo(
+            photo=image_buffer,
+            caption=(
+                "Отсканируйте этот QR-код "
+                "в официальном приложении Telegram.\n\n"
+                "Telegram → Настройки → Устройства → "
+                "Подключить устройство.\n\n"
+                "После сканирования подтвердите вход "
+                "на своём устройстве.\n\n"
+                "Не пересылайте этот QR-код другим людям."
+            ),
         )
 
-        return ConversationHandler.END
+        task = asyncio.create_task(
+            wait_for_qr_authorization(
+                user_id=user_id,
+                chat_id=update.effective_chat.id,
+            ),
+            name=f"telegram-qr-login-{user_id}",
+        )
+
+        register_qr_task(
+            user_id,
+            task,
+        )
+
+        return AUTH_QR
 
     except Exception:
         logger.exception(
-            "Failed to sign in Telegram account "
-            "for user %s",
+            "Failed to create QR login for user %s",
             user_id,
         )
 
         await update.message.reply_text(
-            "Не удалось войти в Telegram. "
-            "Проверьте код и попробуйте ещё раз."
+            "Не удалось создать QR-код "
+            "для подключения Telegram.\n\n"
+            "Попробуйте /connect ещё раз."
         )
 
-        return AUTH_CODE
+        return ConversationHandler.END
 
 
-async def auth_password(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+async def wait_for_qr_authorization(
+    user_id: int,
+    chat_id: int,
 ):
-    if (
-        not update.message
-        or not update.message.text
-        or not update.effective_user
-    ):
-        return AUTH_PASSWORD
+    try:
+        result = await wait_qr_login(
+            user_id
+        )
 
-    user_id = update.effective_user.id
-    password = update.message.text.strip()
+        if result == "authorized":
+            client = await get_telegram_client(
+                user_id
+            )
 
-    client = await get_telegram_client(
-        user_id
+            setup_user_client_callback(
+                client
+            )
+
+            await start_user_polling(
+                user_id
+            )
+
+            await send_bot_message(
+                chat_id,
+                (
+                    "Telegram-аккаунт успешно "
+                    "подключён."
+                ),
+            )
+
+            return
+
+        if result == "password":
+            await send_bot_message(
+                chat_id,
+                (
+                    "QR-код был подтверждён, но "
+                    "Telegram запросил пароль "
+                    "двухэтапной аутентификации.\n\n"
+                    "Я не запрашиваю и не принимаю "
+                    "пароль Telegram через этот бот. "
+                    "Это сделано специально для "
+                    "безопасности аккаунта.\n\n"
+                    "Если Telegram не завершил вход, "
+                    "запустите /connect ещё раз."
+                ),
+            )
+
+            return
+
+        await send_bot_message(
+            chat_id,
+            (
+                "Не удалось завершить подключение "
+                "Telegram. Запустите /connect ещё раз."
+            ),
+        )
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception:
+        logger.exception(
+            "QR authorization failed for user %s",
+            user_id,
+        )
+
+        await send_bot_message(
+            chat_id,
+            (
+                "Подключение Telegram не завершилось.\n\n"
+                "Запустите /connect ещё раз."
+            ),
+        )
+
+
+async def send_bot_message(
+    chat_id: int,
+    text: str,
+):
+    """
+    Отправляет сообщение через Bot API.
+
+    Используется background-задачей QR авторизации.
+    """
+    from telegram import Bot
+
+    if not BOT_TOKEN:
+        logger.error(
+            "BOT_TOKEN is not configured"
+        )
+        return
+
+    bot = Bot(
+        token=BOT_TOKEN
     )
 
     try:
-        await client.sign_in_password(
-            password
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
         )
 
-        context.user_data.pop(
-            "auth_phone",
-            None,
-        )
-        context.user_data.pop(
-            "phone_code_hash",
-            None,
-        )
-
-        setup_user_client_callback(client)
-
-        await start_user_polling(
-            user_id
-        )
-
-        await update.message.reply_text(
-            "Telegram-аккаунт успешно подключён.",
-            reply_markup=main_menu_keyboard(),
-        )
-
-        return ConversationHandler.END
-
-    except Exception:
-        logger.exception(
-            "Failed to sign in with 2FA password "
-            "for user %s",
-            user_id,
-        )
-
-        await update.message.reply_text(
-            "Неверный пароль или не удалось "
-            "завершить авторизацию. "
-            "Попробуйте ещё раз."
-        )
-
-        return AUTH_PASSWORD
+    finally:
+        await bot.shutdown()
 
 
 async def cancel_auth(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    context.user_data.pop(
-        "auth_phone",
-        None,
-    )
-    context.user_data.pop(
-        "phone_code_hash",
-        None,
-    )
+    user = update.effective_user
+
+    if user:
+        await cancel_qr_login(
+            user.id
+        )
 
     if update.message:
         await update.message.reply_text(
@@ -376,7 +360,9 @@ async def cancel_auth(
 async def post_processor(
     post: dict,
 ):
-    user_id = int(post["user_id"])
+    user_id = int(
+        post["user_id"]
+    )
 
     channel_id = int(
         post["channel_id"]
@@ -465,6 +451,14 @@ async def post_processor(
         )
 
 
+def setup_user_client_callback(
+    client: TelegramUserClient,
+):
+    client.set_new_post_callback(
+        post_processor
+    )
+
+
 def build_auth_conversation():
     return ConversationHandler(
         entry_points=[
@@ -474,26 +468,12 @@ def build_auth_conversation():
             )
         ],
         states={
-            AUTH_PHONE: [
+            AUTH_QR: [
                 MessageHandler(
                     filters.TEXT
                     & ~filters.COMMAND,
-                    auth_phone,
-                )
-            ],
-            AUTH_CODE: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    auth_code,
-                )
-            ],
-            AUTH_PASSWORD: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    auth_password,
-                )
+                    lambda update, context: AUTH_QR,
+                ),
             ],
         },
         fallbacks=[
@@ -576,7 +556,9 @@ def build_filter_conversation():
     )
 
 
-async def post_init(application: Application):
+async def post_init(
+    application: Application,
+):
     await create_indexes()
 
     set_new_post_callback(
@@ -590,14 +572,6 @@ async def post_shutdown(
     application: Application,
 ):
     await stop_all_clients()
-
-
-def setup_user_client_callback(
-    client: TelegramUserClient,
-):
-    client.set_new_post_callback(
-        post_processor
-    )
 
 
 async def initialize_authorized_clients():
@@ -635,7 +609,9 @@ async def _get_authorized_users():
 
     return await users_col.find(
         {}
-    ).to_list(length=None)
+    ).to_list(
+        length=None
+    )
 
 
 def build_application() -> Application:

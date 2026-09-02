@@ -13,6 +13,7 @@ from config import (
     TELEGRAM_API_ID,
     TELEGRAM_SESSION_NAME,
 )
+
 from db import (
     get_post,
     get_user_channels,
@@ -47,7 +48,17 @@ class TelegramUserClient:
 
         self.user_id = user_id
 
-        session_dir = "sessions"
+        # Сессии хранятся рядом с приложением.
+        # На Wispbyte папка /home/container должна быть persistent.
+        base_dir = os.path.dirname(
+            os.path.abspath(__file__)
+        )
+
+        session_dir = os.path.join(
+            base_dir,
+            "sessions",
+        )
+
         os.makedirs(
             session_dir,
             exist_ok=True,
@@ -66,6 +77,9 @@ class TelegramUserClient:
 
         self._post_callback: Optional[PostCallback] = None
         self._polling = False
+
+        # Текущая QR-сессия авторизации.
+        self._qr_login = None
 
     def set_new_post_callback(
         self,
@@ -89,7 +103,7 @@ class TelegramUserClient:
         me = await self.client.get_me()
 
         logger.info(
-            "Telegram client started for user %s: %s",
+            "Telegram client started for user %s: username=%s",
             self.user_id,
             getattr(me, "username", None),
         )
@@ -98,6 +112,7 @@ class TelegramUserClient:
 
     async def stop(self) -> None:
         self._polling = False
+        self._qr_login = None
 
         if self.client.is_connected():
             await self.client.disconnect()
@@ -108,50 +123,72 @@ class TelegramUserClient:
 
         return await self.client.is_user_authorized()
 
-    async def send_code(
-        self,
-        phone: str,
-    ):
+    async def create_qr_login(self):
+        """
+        Создаёт новую QR-сессию авторизации.
+
+        Возвращает объект QRLogin из Telethon.
+        """
         if not self.client.is_connected():
             await self.client.connect()
 
-        return await self.client.send_code_request(
-            phone
+        if await self.client.is_user_authorized():
+            return None
+
+        self._qr_login = await self.client.qr_login()
+
+        logger.info(
+            "QR login created for user %s",
+            self.user_id,
         )
 
-    async def sign_in(
-        self,
-        phone: str,
-        code: str,
-        phone_code_hash: str,
-    ) -> str:
-        if not self.client.is_connected():
-            await self.client.connect()
+        return self._qr_login
 
-        try:
-            await self.client.sign_in(
-                phone=phone,
-                code=code,
-                phone_code_hash=phone_code_hash,
+    async def wait_qr_login(self) -> str:
+        """
+        Ожидает подтверждения QR-кода в Telegram.
+
+        Возможные результаты:
+        - authorized
+        - password
+        """
+        if self._qr_login is None:
+            raise RuntimeError(
+                "QR login has not been created"
             )
 
+        try:
+            await self._qr_login.wait()
+
+            if await self.client.is_user_authorized():
+                logger.info(
+                    "QR login completed for user %s",
+                    self.user_id,
+                )
+
+                return "authorized"
+
+            return "failed"
+
         except SessionPasswordNeededError:
+            logger.warning(
+                "2FA password is required for user %s",
+                self.user_id,
+            )
+
             return "password"
 
-        return "authorized"
+        finally:
+            self._qr_login = None
 
-    async def sign_in_password(
-        self,
-        password: str,
-    ) -> str:
-        if not self.client.is_connected():
-            await self.client.connect()
+    async def cancel_qr_login(self) -> None:
+        """
+        Отменяет текущую QR-сессию.
 
-        await self.client.sign_in(
-            password=password,
-        )
-
-        return "authorized"
+        Сам Telethon не требует отдельного revoke:
+        после истечения срока действия QR токен становится недействительным.
+        """
+        self._qr_login = None
 
     async def check_channel_access(
         self,
@@ -176,6 +213,7 @@ class TelegramUserClient:
                 channel_input,
                 self.user_id,
             )
+
             return None
 
     async def _fetch_new_messages(
@@ -226,7 +264,10 @@ class TelegramUserClient:
                 for message in messages
             )
 
-            if new_offset <= 0 or new_offset == offset_id:
+            if (
+                new_offset <= 0
+                or new_offset == offset_id
+            ):
                 break
 
             offset_id = new_offset
@@ -297,9 +338,9 @@ class TelegramUserClient:
                 has_media=has_media,
             )
 
-        # Если пост уже processed, повторно его не обрабатываем.
-        if existing_post and existing_post.get(
-            "processed"
+        if (
+            existing_post
+            and existing_post.get("processed")
         ):
             return True
 
@@ -309,6 +350,7 @@ class TelegramUserClient:
                 "for user %s",
                 self.user_id,
             )
+
             return False
 
         post_data = {
@@ -363,10 +405,11 @@ class TelegramUserClient:
 
                 if not success:
                     logger.warning(
-                        "Stopping channel processing after "
-                        "failed message %s",
+                        "Stopping channel processing "
+                        "after failed message %s",
                         message.id,
                     )
+
                     break
 
                 await update_channel_last_message(

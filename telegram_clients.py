@@ -7,8 +7,10 @@ from telegram_client import TelegramUserClient
 
 logger = logging.getLogger(__name__)
 
+
 _clients: dict[int, TelegramUserClient] = {}
 _polling_tasks: dict[int, asyncio.Task] = {}
+_qr_tasks: dict[int, asyncio.Task] = {}
 
 _post_callback = None
 
@@ -47,6 +49,116 @@ async def get_telegram_client(
         )
 
     return client
+
+
+async def start_qr_login(
+    user_id: int,
+):
+    """
+    Создаёт QR-login для пользователя.
+
+    Возвращает:
+        QRLogin | None
+    """
+    client = await get_telegram_client(
+        user_id
+    )
+
+    if await client.is_authorized():
+        return None
+
+    return await client.create_qr_login()
+
+
+async def wait_qr_login(
+    user_id: int,
+) -> str:
+    client = await get_telegram_client(
+        user_id
+    )
+
+    return await client.wait_qr_login()
+
+
+async def cancel_qr_login(
+    user_id: int,
+) -> None:
+    task = _qr_tasks.pop(
+        user_id,
+        None,
+    )
+
+    if task is not None:
+        task.cancel()
+
+        await asyncio.gather(
+            task,
+            return_exceptions=True,
+        )
+
+    client = _clients.get(
+        user_id
+    )
+
+    if client is not None:
+        await client.cancel_qr_login()
+
+
+def register_qr_task(
+    user_id: int,
+    task: asyncio.Task,
+) -> None:
+    old_task = _qr_tasks.get(
+        user_id
+    )
+
+    if (
+        old_task is not None
+        and not old_task.done()
+    ):
+        old_task.cancel()
+
+    _qr_tasks[user_id] = task
+
+    def _task_done(
+        completed_task: asyncio.Task,
+    ):
+        current = _qr_tasks.get(
+            user_id
+        )
+
+        if current is completed_task:
+            _qr_tasks.pop(
+                user_id,
+                None,
+            )
+
+        try:
+            exception = completed_task.exception()
+
+            if exception:
+                logger.error(
+                    "QR login task failed for user %s",
+                    user_id,
+                    exc_info=(
+                        type(exception),
+                        exception,
+                        exception.__traceback__,
+                    ),
+                )
+
+        except asyncio.CancelledError:
+            pass
+
+        except Exception:
+            logger.exception(
+                "Failed to inspect QR task for user %s",
+                user_id,
+            )
+
+    task.add_done_callback(
+        _task_done
+    )
 
 
 async def start_user_polling(
@@ -125,6 +237,10 @@ async def start_user_polling(
 async def stop_user_client(
     user_id: int,
 ) -> None:
+    await cancel_qr_login(
+        user_id
+    )
+
     task: Optional[asyncio.Task] = (
         _polling_tasks.pop(
             user_id,
@@ -158,6 +274,7 @@ async def stop_all_clients() -> None:
     user_ids = list(
         set(_clients.keys())
         | set(_polling_tasks.keys())
+        | set(_qr_tasks.keys())
     )
 
     if not user_ids:
