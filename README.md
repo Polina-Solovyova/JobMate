@@ -513,13 +513,6 @@ MONGO_DB_NAME=jobmate
 | `TELEGRAM_SESSION_NAME` | базовое имя Telethon-сессии |
 | `MONGO_DB_NAME`         | название базы MongoDB       |
 
-Следующие переменные в текущей архитектуре не используются:
-
-```text
-OWNER_USER_ID
-NOTIFICATION_CHAT_ID
-```
-
 ## 5. Запуск
 
 ```bash
