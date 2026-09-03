@@ -11,10 +11,13 @@ from db import (
     toggle_channel,
     update_user_channel,
 )
+
 from keyboards import (
+    channel_actions_keyboard,
     channels_list_keyboard,
     main_menu_keyboard,
 )
+
 from telegram_clients import get_telegram_client
 
 
@@ -52,6 +55,19 @@ def normalize_channel_input(value: str) -> str:
     return value
 
 
+async def main_menu_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        "Главное меню",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
 async def my_channels_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -73,9 +89,7 @@ async def my_channels_callback(
 
     await query.edit_message_text(
         text=text,
-        reply_markup=channels_list_keyboard(
-            channels
-        ),
+        reply_markup=channels_list_keyboard(channels),
     )
 
 
@@ -95,7 +109,8 @@ async def add_channel_callback(
         "Отправьте username или ссылку на Telegram-канал.\n\n"
         "Например:\n"
         "@vacancies_channel\n"
-        "https://t.me/vacancies_channel"
+        "https://t.me/vacancies_channel\n\n"
+        "Для отмены нажмите /start."
     )
 
     return WAITING_CHANNEL
@@ -141,9 +156,7 @@ async def add_channel_input(
         )
         return WAITING_CHANNEL
 
-    client = await get_telegram_client(
-        user_id
-    )
+    client = await get_telegram_client(user_id)
 
     try:
         if not await client.is_authorized():
@@ -276,6 +289,82 @@ async def _get_channel_by_document_id(
     return None, channels
 
 
+async def channel_detail_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+
+    document_id = (
+        query.data or ""
+    ).removeprefix("channel_")
+
+    try:
+        channel, channels = await _get_channel_by_document_id(
+            user_id,
+            document_id,
+        )
+
+        if channel is None:
+            await query.edit_message_text(
+                "Канал не найден.",
+                reply_markup=channels_list_keyboard(
+                    channels
+                ),
+            )
+            return
+
+        channel_id = int(
+            channel["channel_id"]
+        )
+
+        username = channel.get(
+            "channel_username"
+        )
+
+        title = channel.get(
+            "channel_title"
+        )
+
+        enabled = channel.get(
+            "enabled",
+            True,
+        )
+
+        lines = [
+            f"Канал: {title or username or channel_id}",
+            "",
+            f"Username: {username or '—'}",
+            f"ID: {channel_id}",
+            f"Статус: {'включён' if enabled else 'выключен'}",
+        ]
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=channel_actions_keyboard(
+                channel_id=document_id,
+                enabled=enabled,
+            ),
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to open channel %s for user %s",
+            document_id,
+            user_id,
+        )
+
+        await query.edit_message_text(
+            "Не удалось открыть канал.",
+            reply_markup=channels_list_keyboard(
+                channels
+            ),
+        )
+
+
 async def toggle_channel_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -325,16 +414,13 @@ async def toggle_channel_callback(
             )
             return
 
-        channels = await get_user_channels(
-            user_id=user_id,
-        )
-
         await query.edit_message_text(
             "Канал включён."
             if enabled
             else "Канал выключен.",
-            reply_markup=channels_list_keyboard(
-                channels
+            reply_markup=channel_actions_keyboard(
+                channel_id=document_id,
+                enabled=enabled,
             ),
         )
 

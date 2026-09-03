@@ -72,6 +72,26 @@ async def get_user(
     )
 
 
+async def get_user_ids_with_enabled_channels() -> List[int]:
+    cursor = user_channels_col.find(
+        {
+            "enabled": True,
+        },
+        {
+            "user_id": 1,
+        },
+    )
+
+    user_ids = set()
+
+    async for document in cursor:
+        user_id = document.get("user_id")
+
+        if user_id is not None:
+            user_ids.add(int(user_id))
+
+    return list(user_ids)
+
 # ---------------------------------------------------------------------
 # Channels
 # ---------------------------------------------------------------------

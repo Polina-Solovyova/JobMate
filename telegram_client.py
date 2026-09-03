@@ -5,7 +5,10 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    ChannelPrivateError,
+)
 from telethon.tl.types import Channel
 
 from config import (
@@ -19,6 +22,7 @@ from db import (
     get_user_channels,
     save_post,
     update_channel_last_message,
+    update_user_channel,
 )
 
 
@@ -32,10 +36,12 @@ PostCallback = Callable[
 
 
 class TelegramUserClient:
+
     def __init__(
         self,
         user_id: int,
     ):
+
         if not TELEGRAM_API_ID:
             raise RuntimeError(
                 "TELEGRAM_API_ID is not configured"
@@ -48,8 +54,6 @@ class TelegramUserClient:
 
         self.user_id = user_id
 
-        # Сессии хранятся рядом с приложением.
-        # На Wispbyte папка /home/container должна быть persistent.
         base_dir = os.path.dirname(
             os.path.abspath(__file__)
         )
@@ -77,17 +81,17 @@ class TelegramUserClient:
 
         self._post_callback: Optional[PostCallback] = None
         self._polling = False
-
-        # Текущая QR-сессия авторизации.
         self._qr_login = None
 
     def set_new_post_callback(
         self,
         callback: PostCallback,
     ) -> None:
+
         self._post_callback = callback
 
     async def start(self) -> bool:
+
         if not self.client.is_connected():
             await self.client.connect()
 
@@ -95,7 +99,8 @@ class TelegramUserClient:
 
         if not authorized:
             logger.warning(
-                "Telegram session is not authorized for user %s",
+                "Telegram session is not authorized "
+                "for user %s",
                 self.user_id,
             )
             return False
@@ -111,6 +116,7 @@ class TelegramUserClient:
         return True
 
     async def stop(self) -> None:
+
         self._polling = False
         self._qr_login = None
 
@@ -118,17 +124,14 @@ class TelegramUserClient:
             await self.client.disconnect()
 
     async def is_authorized(self) -> bool:
+
         if not self.client.is_connected():
             await self.client.connect()
 
         return await self.client.is_user_authorized()
 
     async def create_qr_login(self):
-        """
-        Создаёт новую QR-сессию авторизации.
 
-        Возвращает объект QRLogin из Telethon.
-        """
         if not self.client.is_connected():
             await self.client.connect()
 
@@ -145,13 +148,7 @@ class TelegramUserClient:
         return self._qr_login
 
     async def wait_qr_login(self) -> str:
-        """
-        Ожидает подтверждения QR-кода в Telegram.
 
-        Возможные результаты:
-        - authorized
-        - password
-        """
         if self._qr_login is None:
             raise RuntimeError(
                 "QR login has not been created"
@@ -182,18 +179,13 @@ class TelegramUserClient:
             self._qr_login = None
 
     async def cancel_qr_login(self) -> None:
-        """
-        Отменяет текущую QR-сессию.
-
-        Сам Telethon не требует отдельного revoke:
-        после истечения срока действия QR токен становится недействительным.
-        """
         self._qr_login = None
 
     async def check_channel_access(
         self,
         channel_input: str,
     ) -> Optional[Channel]:
+
         if not await self.is_authorized():
             return None
 
@@ -207,9 +199,20 @@ class TelegramUserClient:
 
             return entity
 
+        except ChannelPrivateError:
+            logger.warning(
+                "No access to channel %s "
+                "for user %s",
+                channel_input,
+                self.user_id,
+            )
+
+            return None
+
         except Exception:
             logger.exception(
-                "Failed to access channel %s for user %s",
+                "Failed to access channel %s "
+                "for user %s",
                 channel_input,
                 self.user_id,
             )
@@ -221,6 +224,7 @@ class TelegramUserClient:
         channel: Dict[str, Any],
         page_size: int = 100,
     ) -> List[Any]:
+
         channel_id = int(
             channel["channel_id"]
         )
@@ -292,6 +296,7 @@ class TelegramUserClient:
         channel: Dict[str, Any],
         message: Any,
     ) -> bool:
+
         channel_id = int(
             channel["channel_id"]
         )
@@ -345,12 +350,11 @@ class TelegramUserClient:
             return True
 
         if self._post_callback is None:
-            logger.warning(
+            logger.error(
                 "Post callback is not configured "
                 "for user %s",
                 self.user_id,
             )
-
             return False
 
         post_data = {
@@ -368,6 +372,15 @@ class TelegramUserClient:
             "has_media": has_media,
         }
 
+        logger.info(
+            "PROCESSING NEW POST: "
+            "user=%s channel=%s message_id=%s text=%r",
+            self.user_id,
+            channel_id,
+            message_id,
+            text[:300],
+        )
+
         await self._post_callback(
             post_data
         )
@@ -378,6 +391,7 @@ class TelegramUserClient:
         self,
         channel: Dict[str, Any],
     ) -> None:
+
         channel_id = int(
             channel["channel_id"]
         )
@@ -398,6 +412,7 @@ class TelegramUserClient:
                 return
 
             for message in messages:
+
                 success = await self._process_message(
                     channel,
                     message,
@@ -409,7 +424,6 @@ class TelegramUserClient:
                         "after failed message %s",
                         message.id,
                     )
-
                     break
 
                 await update_channel_last_message(
@@ -423,20 +437,54 @@ class TelegramUserClient:
                     ),
                 )
 
+        except ChannelPrivateError:
+
+            logger.warning(
+                "Channel %s is private or inaccessible "
+                "for user %s. Disabling channel.",
+                channel_id,
+                self.user_id,
+            )
+
+            try:
+                await update_user_channel(
+                    user_id=self.user_id,
+                    channel_id=channel_id,
+                    updates={
+                        "enabled": False,
+                    },
+                )
+
+                logger.info(
+                    "Channel %s disabled because "
+                    "it is inaccessible.",
+                    channel_id,
+                )
+
+            except Exception:
+                logger.exception(
+                    "Failed to disable inaccessible "
+                    "channel %s",
+                    channel_id,
+                )
+
         except Exception:
             logger.exception(
-                "Failed to poll channel %s for user %s",
+                "Failed to poll channel %s "
+                "for user %s",
                 channel_id,
                 self.user_id,
             )
 
     async def _poll_channels(self) -> None:
+
         channels = await get_user_channels(
             user_id=self.user_id,
             enabled_only=True,
         )
 
         for channel in channels:
+
             if not self._polling:
                 break
 
@@ -448,6 +496,7 @@ class TelegramUserClient:
         self,
         interval: int = 30,
     ) -> None:
+
         if not await self.start():
             return
 
@@ -455,6 +504,7 @@ class TelegramUserClient:
 
         try:
             while self._polling:
+
                 await self._poll_channels()
 
                 if self._polling:
@@ -467,7 +517,8 @@ class TelegramUserClient:
 
         except Exception:
             logger.exception(
-                "Telegram polling stopped for user %s",
+                "Telegram polling stopped "
+                "for user %s",
                 self.user_id,
             )
 
@@ -475,6 +526,7 @@ class TelegramUserClient:
             self._polling = False
 
     async def run(self) -> None:
+
         if not await self.start():
             return
 

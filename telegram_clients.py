@@ -4,6 +4,7 @@ from typing import Optional
 
 from telegram_client import TelegramUserClient
 
+from db import get_user_ids_with_enabled_channels
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,10 @@ _post_callback = None
 
 
 def set_new_post_callback(callback) -> None:
+    """
+    Устанавливает единый callback для всех Telegram-клиентов.
+    """
+
     global _post_callback
 
     _post_callback = callback
@@ -29,7 +34,10 @@ def set_new_post_callback(callback) -> None:
 async def get_telegram_client(
     user_id: int,
 ) -> TelegramUserClient:
-    client = _clients.get(user_id)
+
+    client = _clients.get(
+        user_id
+    )
 
     if client is None:
         client = TelegramUserClient(
@@ -54,12 +62,6 @@ async def get_telegram_client(
 async def start_qr_login(
     user_id: int,
 ):
-    """
-    Создаёт QR-login для пользователя.
-
-    Возвращает:
-        QRLogin | None
-    """
     client = await get_telegram_client(
         user_id
     )
@@ -73,6 +75,7 @@ async def start_qr_login(
 async def wait_qr_login(
     user_id: int,
 ) -> str:
+
     client = await get_telegram_client(
         user_id
     )
@@ -83,6 +86,7 @@ async def wait_qr_login(
 async def cancel_qr_login(
     user_id: int,
 ) -> None:
+
     task = _qr_tasks.pop(
         user_id,
         None,
@@ -108,6 +112,7 @@ def register_qr_task(
     user_id: int,
     task: asyncio.Task,
 ) -> None:
+
     old_task = _qr_tasks.get(
         user_id
     )
@@ -160,11 +165,56 @@ def register_qr_task(
         _task_done
     )
 
+async def start_all_user_polling(
+    interval: int = 30,
+) -> None:
+
+    user_ids = await get_user_ids_with_enabled_channels()
+
+    if not user_ids:
+        logger.info(
+            "Нет пользователей с включёнными каналами."
+        )
+        return
+
+    logger.info(
+        "Найдено %s пользователей "
+        "для запуска Telegram polling.",
+        len(user_ids),
+    )
+
+    for user_id in user_ids:
+        try:
+            started = await start_user_polling(
+                user_id=user_id,
+                interval=interval,
+            )
+
+            if started:
+                logger.info(
+                    "Polling запущен для пользователя %s",
+                    user_id,
+                )
+            else:
+                logger.warning(
+                    "Не удалось запустить polling "
+                    "для пользователя %s: "
+                    "Telegram-сессия не авторизована.",
+                    user_id,
+                )
+
+        except Exception:
+            logger.exception(
+                "Ошибка запуска polling "
+                "для пользователя %s",
+                user_id,
+            )
 
 async def start_user_polling(
     user_id: int,
     interval: int = 30,
 ) -> bool:
+
     client = await get_telegram_client(
         user_id
     )
@@ -180,6 +230,11 @@ async def start_user_polling(
         existing_task is not None
         and not existing_task.done()
     ):
+        logger.info(
+            "Telegram polling already running "
+            "for user %s",
+            user_id,
+        )
         return True
 
     task = asyncio.create_task(
@@ -194,10 +249,15 @@ async def start_user_polling(
     def _task_done(
         completed_task: asyncio.Task,
     ):
-        _polling_tasks.pop(
-            user_id,
-            None,
+        current = _polling_tasks.get(
+            user_id
         )
+
+        if current is completed_task:
+            _polling_tasks.pop(
+                user_id,
+                None,
+            )
 
         try:
             exception = completed_task.exception()
@@ -218,7 +278,8 @@ async def start_user_polling(
 
         except Exception:
             logger.exception(
-                "Failed to inspect polling task for user %s",
+                "Failed to inspect polling task "
+                "for user %s",
                 user_id,
             )
 
@@ -237,6 +298,7 @@ async def start_user_polling(
 async def stop_user_client(
     user_id: int,
 ) -> None:
+
     await cancel_qr_login(
         user_id
     )
@@ -271,6 +333,7 @@ async def stop_user_client(
 
 
 async def stop_all_clients() -> None:
+
     user_ids = list(
         set(_clients.keys())
         | set(_polling_tasks.keys())

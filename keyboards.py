@@ -157,8 +157,8 @@ def filter_actions_keyboard(
 
 
 def channel_actions_keyboard(
-    channel_id: int,
-    enabled: bool = True,
+    channel_id,
+    enabled=True,
 ):
     toggle_text = (
         "Выключить"
@@ -206,7 +206,7 @@ def channels_list_keyboard(channels):
     buttons = []
 
     for channel in channels:
-        channel_id = channel["channel_id"]
+        channel_id = channel["_id"]
 
         username = channel.get(
             "channel_username"
@@ -221,7 +221,12 @@ def channels_list_keyboard(channels):
         elif title:
             name = title
         else:
-            name = str(channel_id)
+            name = str(
+                channel.get(
+                    "channel_id",
+                    channel_id,
+                )
+            )
 
         enabled = channel.get(
             "enabled",

@@ -2,52 +2,36 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from db import create_user
-from keyboards import main_menu_keyboard
-from telegram_clients import (
-    get_telegram_client,
-    start_user_polling,
-)
+from telegram_clients import get_telegram_client, start_user_polling
 
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if update.effective_user is None:
-        return
-
-    if update.message is None:
-        return
-
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+
+    if user is None or update.message is None:
+        return
 
     await create_user(
         user_id=user.id,
         username=user.username,
     )
 
-    client = await get_telegram_client(
-        user.id
-    )
+    client = await get_telegram_client(user.id)
 
     if await client.is_authorized():
-        await start_user_polling(
-            user.id
-        )
+        started = await start_user_polling(user.id)
 
-        await update.message.reply_text(
-            "Telegram-аккаунт подключён.\n\n"
-            "Выберите действие:",
-            reply_markup=main_menu_keyboard(),
-        )
+        if started:
+            await update.message.reply_text(
+                "Бот подключён и начал отслеживать вакансии."
+            )
+        else:
+            await update.message.reply_text(
+                "Бот уже отслеживает вакансии."
+            )
+
         return
 
     await update.message.reply_text(
-        "Добро пожаловать в JobMate.\n\n"
-        "Я отслеживаю выбранные Telegram-каналы "
-        "и отправляю вакансии, которые соответствуют "
-        "вашим фильтрам.\n\n"
-        "Для начала подключите Telegram-аккаунт "
-        "командой /connect.",
-        reply_markup=main_menu_keyboard(),
+        "Для начала работы нужно подключить Telegram-аккаунт."
     )

@@ -9,12 +9,15 @@ from db import (
     toggle_filter,
     update_filter,
 )
+
 from filters import parse_query_to_filter
+
 from keyboards import (
     filter_actions_keyboard,
     filters_list_keyboard,
     main_menu_keyboard,
 )
+
 
 WAITING_FILTER_QUERY = 1
 WAITING_FILTER_EDIT = 2
@@ -28,7 +31,10 @@ async def my_filters_callback(
     await query.answer()
 
     user_id = update.effective_user.id
-    filters_data = await get_filters(user_id)
+
+    filters_data = await get_filters(
+        user_id
+    )
 
     await query.edit_message_text(
         "Ваши фильтры:",
@@ -100,12 +106,16 @@ async def filter_input(
     )
 
     try:
-        parsed = parse_query_to_filter(text)
+        parsed = parse_query_to_filter(
+            text
+        )
+
     except Exception:
         await update.message.reply_text(
             "Не удалось разобрать запрос. "
             "Попробуйте сформулировать его проще."
         )
+
         return (
             WAITING_FILTER_EDIT
             if editing_filter_id
@@ -116,6 +126,7 @@ async def filter_input(
         await update.message.reply_text(
             "Не удалось создать фильтр из этого запроса."
         )
+
         return (
             WAITING_FILTER_EDIT
             if editing_filter_id
@@ -127,14 +138,28 @@ async def filter_input(
     filter_updates = {
         "name": name,
         "query": text,
-        "required": parsed.get("required", []),
-        "optional": parsed.get("optional", []),
-        "excluded": parsed.get("excluded", []),
-        "location": parsed.get("location"),
-        "experience": parsed.get("experience"),
+        "required": parsed.get(
+            "required",
+            [],
+        ),
+        "optional": parsed.get(
+            "optional",
+            [],
+        ),
+        "excluded": parsed.get(
+            "excluded",
+            [],
+        ),
+        "location": parsed.get(
+            "location"
+        ),
+        "experience": parsed.get(
+            "experience"
+        ),
     }
 
     if editing_filter_id:
+
         existing_filter = await get_filter(
             user_id=user_id,
             filter_id=editing_filter_id,
@@ -178,15 +203,28 @@ async def filter_input(
 
         return ConversationHandler.END
 
-    filter_id = await add_filter(
+    await add_filter(
         user_id=user_id,
         name=name,
         query=text,
-        required=parsed.get("required", []),
-        optional=parsed.get("optional", []),
-        excluded=parsed.get("excluded", []),
-        location=parsed.get("location"),
-        experience=parsed.get("experience"),
+        required=parsed.get(
+            "required",
+            [],
+        ),
+        optional=parsed.get(
+            "optional",
+            [],
+        ),
+        excluded=parsed.get(
+            "excluded",
+            [],
+        ),
+        location=parsed.get(
+            "location"
+        ),
+        experience=parsed.get(
+            "experience"
+        ),
         enabled=True,
     )
 
@@ -206,6 +244,7 @@ async def filter_detail_callback(
     await query.answer()
 
     user_id = update.effective_user.id
+
     filter_id = query.data.replace(
         "filter_",
         "",
@@ -315,7 +354,9 @@ async def filter_detail_callback(
     await query.edit_message_text(
         "\n".join(lines),
         reply_markup=filter_actions_keyboard(
-            filter_id=str(filter_data["_id"]),
+            filter_id=str(
+                filter_data["_id"]
+            ),
             enabled=enabled,
         ),
     )
@@ -364,7 +405,7 @@ async def filter_action_callback(
         )
 
     else:
-        return ConversationHandler.END
+        return
 
     filter_data = await get_filter(
         user_id=user_id,
@@ -376,9 +417,10 @@ async def filter_action_callback(
             "Фильтр не найден.",
             reply_markup=main_menu_keyboard(),
         )
-        return ConversationHandler.END
+        return
 
     if action == "toggle":
+
         enabled = not filter_data.get(
             "enabled",
             True,
@@ -395,7 +437,7 @@ async def filter_action_callback(
                 "Не удалось изменить статус фильтра.",
                 reply_markup=main_menu_keyboard(),
             )
-            return ConversationHandler.END
+            return
 
         await query.edit_message_text(
             "Фильтр включён."
@@ -407,9 +449,10 @@ async def filter_action_callback(
             ),
         )
 
-        return ConversationHandler.END
+        return
 
     if action == "delete":
+
         await query.edit_message_text(
             "Удалить этот фильтр?",
             reply_markup=filter_actions_keyboard(
@@ -421,9 +464,11 @@ async def filter_action_callback(
                 confirm_delete=True,
             ),
         )
-        return ConversationHandler.END
+
+        return
 
     if action == "confirm_delete":
+
         deleted = await delete_filter(
             user_id=user_id,
             filter_id=filter_id,
@@ -440,19 +485,18 @@ async def filter_action_callback(
                 reply_markup=main_menu_keyboard(),
             )
 
-        return ConversationHandler.END
+        return
 
     if action == "edit":
+
         context.user_data[
             "editing_filter_id"
         ] = filter_id
 
         await query.edit_message_text(
             "Введите новый запрос для фильтра.\n\n"
-            f"Текущий запрос:\n"
+            "Текущий запрос:\n"
             f"{filter_data.get('query', '')}"
         )
 
         return WAITING_FILTER_EDIT
-
-    return ConversationHandler.END

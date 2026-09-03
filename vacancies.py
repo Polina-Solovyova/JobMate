@@ -1,6 +1,7 @@
 import re
 from typing import Any, Dict, List, Optional
 
+from digest_parser import extract_digest_items
 from matching import check_vacancy_against_filter
 
 
@@ -76,12 +77,12 @@ EMPLOYMENT_INDICATORS = [
 ]
 
 
+# Эти слова сами по себе не должны убивать дайджест.
+# "дайджест" и "подборка вакансий" здесь специально НЕ находятся.
 NOT_VACANCY_INDICATORS = [
     "реклама",
     "рекламный пост",
     "новости",
-    "дайджест",
-    "подборка вакансий",
     "анонс",
     "мероприятие",
     "вебинар",
@@ -93,6 +94,36 @@ NOT_VACANCY_INDICATORS = [
     "акция",
     "промокод",
     "розыгрыш",
+]
+
+
+DIGEST_INDICATORS = [
+    "подборка вакансий",
+    "подборка вакансий дня",
+    "вакансии дня",
+    "вакансия дня",
+    "вакансии недели",
+    "вакансии месяца",
+    "лучшие вакансии",
+    "новые вакансии",
+    "свежие вакансии",
+    "горячие вакансии",
+    "дайджест вакансий",
+    "job digest",
+    "vacancy digest",
+    "daily jobs",
+    "jobs of the day",
+    "job of the day",
+]
+
+
+DAILY_DIGEST_INDICATORS = [
+    "вакансии дня",
+    "вакансия дня",
+    "подборка вакансий дня",
+    "daily jobs",
+    "jobs of the day",
+    "job of the day",
 ]
 
 
@@ -165,7 +196,10 @@ def _normalize_text(text: str) -> str:
     ).strip()
 
 
-def _contains_term(text: str, term: str) -> bool:
+def _contains_term(
+    text: str,
+    term: str,
+) -> bool:
     escaped = re.escape(term.lower())
 
     return re.search(
@@ -175,7 +209,48 @@ def _contains_term(text: str, term: str) -> bool:
     ) is not None
 
 
+def detect_post_type(text: str) -> str:
+    """
+    Определяет тип Telegram-поста.
+
+    Возможные значения:
+    - vacancy
+    - digest
+    - daily_digest
+    - unknown
+    """
+    if not text or len(text.strip()) < 10:
+        return "unknown"
+
+    normalized = _normalize_text(text)
+
+    # Сначала проверяем дайджесты.
+    if any(
+        _contains_term(normalized, indicator)
+        for indicator in DAILY_DIGEST_INDICATORS
+    ):
+        return "daily_digest"
+
+    if any(
+        _contains_term(normalized, indicator)
+        for indicator in DIGEST_INDICATORS
+    ):
+        return "digest"
+
+    # После этого определяем обычную вакансию.
+    if is_vacancy(text):
+        return "vacancy"
+
+    return "unknown"
+
+
 def is_vacancy(text: str) -> bool:
+    """
+    Определяет, похож ли пост на обычную вакансию.
+
+    Дайджесты здесь не определяются как отдельный тип:
+    для них используется detect_post_type().
+    """
     if not text or len(text.strip()) < 20:
         return False
 
@@ -246,17 +321,22 @@ def is_vacancy(text: str) -> bool:
     return False
 
 
-def _extract_salary(text: str) -> Optional[str]:
+def _extract_salary(
+    text: str,
+) -> Optional[str]:
     patterns = [
-        r"(?:зп|зарплата|оклад|salary|compensation)"
-        r"\s*[:\-]?\s*"
-        r"((?:от|до)?\s*\d[\d\s.,]*"
-        r"\s*(?:₽|руб\.?|рублей|usd|eur|€|\$)?)",
-
-        r"(\d[\d\s.,]*)"
-        r"\s*(?:₽|руб\.?|рублей|usd|eur|€|\$)"
-        r"(?:\s*[-–—]\s*\d[\d\s.,]*"
-        r"\s*(?:₽|руб\.?|рублей|usd|eur|€|\$)?)?",
+        (
+            r"(?:зп|зарплата|оклад|salary|compensation)"
+            r"\s*[:\-]?\s*"
+            r"((?:от|до)?\s*\d[\d\s.,]*"
+            r"\s*(?:₽|руб\.?|рублей|usd|eur|€|\$)?)"
+        ),
+        (
+            r"(\d[\d\s.,]*)"
+            r"\s*(?:₽|руб\.?|рублей|usd|eur|€|\$)"
+            r"(?:\s*[-–—]\s*\d[\d\s.,]*"
+            r"\s*(?:₽|руб\.?|рублей|usd|eur|€|\$)?)?"
+        ),
     ]
 
     for pattern in patterns:
@@ -276,7 +356,9 @@ def _extract_salary(text: str) -> Optional[str]:
     return None
 
 
-def _extract_contacts(text: str) -> Optional[str]:
+def _extract_contacts(
+    text: str,
+) -> Optional[str]:
     contacts: List[str] = []
 
     emails = re.findall(
@@ -301,7 +383,9 @@ def _extract_contacts(text: str) -> Optional[str]:
     return ", ".join(contacts)
 
 
-def _extract_title(text: str) -> Optional[str]:
+def _extract_title(
+    text: str,
+) -> Optional[str]:
     lines = [
         line.strip()
         for line in text.splitlines()
@@ -319,7 +403,7 @@ def _extract_title(text: str) -> Optional[str]:
             for pattern in TITLE_PATTERNS
         ):
             cleaned = re.sub(
-                r"^[#*_•\-\s]+",
+                r"^[#*_\-•\s]+",
                 "",
                 line,
             ).strip()
@@ -329,7 +413,7 @@ def _extract_title(text: str) -> Optional[str]:
 
     for line in lines[:5]:
         cleaned = re.sub(
-            r"^[#*_•\-\s]+",
+            r"^[#*_\-•\s]+",
             "",
             line,
         ).strip()
@@ -340,11 +424,14 @@ def _extract_title(text: str) -> Optional[str]:
     return None
 
 
-def _extract_location(text: str) -> Optional[str]:
+def _extract_location(
+    text: str,
+) -> Optional[str]:
     normalized = text.lower()
 
     if re.search(
-        r"\b(?:remote|удалённо|удаленно|дистанционно|удалёнка|удаленка)\b",
+        r"\b(?:remote|удалённо|удаленно|дистанционно|"
+        r"удалёнка|удаленка)\b",
         normalized,
     ):
         return "Удалённо"
@@ -380,19 +467,26 @@ def _extract_location(text: str) -> Optional[str]:
     return None
 
 
-def _extract_experience(text: str) -> Optional[str]:
+def _extract_experience(
+    text: str,
+) -> Optional[str]:
     patterns = [
-        r"(?:опыт|experience)"
-        r"\s*(?:работы)?\s*"
-        r"(?:от\s*)?"
-        r"\d+\+?\s*"
-        r"(?:год(?:а|ов)?|лет|year(?:s)?)",
-
-        r"(?:от\s*)?\d+\+?\s*"
-        r"(?:год(?:а|ов)?|лет|year(?:s)?)"
-        r"\s*(?:опыта|experience)?",
-
-        r"(?:без опыта|no experience|entry[- ]level|junior)",
+        (
+            r"(?:опыт|experience)"
+            r"\s*(?:работы)?\s*"
+            r"(?:от\s*)?"
+            r"\d+\+?\s*"
+            r"(?:год(?:а|ов)?|лет|year(?:s)?)"
+        ),
+        (
+            r"(?:от\s*)?\d+\+?\s*"
+            r"(?:год(?:а|ов)?|лет|year(?:s)?)"
+            r"\s*(?:опыта|experience)?"
+        ),
+        (
+            r"(?:без опыта|no experience|entry[- ]level|junior|"
+            r"стаж[её]р|intern)"
+        ),
     ]
 
     for pattern in patterns:
@@ -408,18 +502,25 @@ def _extract_experience(text: str) -> Optional[str]:
     return None
 
 
-def _extract_skills(text: str) -> List[str]:
+def _extract_skills(
+    text: str,
+) -> List[str]:
     normalized = text.lower()
     found: List[str] = []
 
     for skill in SKILL_PATTERNS:
-        if _contains_term(normalized, skill):
+        if _contains_term(
+            normalized,
+            skill,
+        ):
             found.append(skill)
 
     return sorted(set(found))
 
 
-def extract_vacancy(text: str) -> Dict[str, Any]:
+def extract_vacancy(
+    text: str,
+) -> Dict[str, Any]:
     raw_text = text or ""
     cleaned_text = raw_text.strip()
 
@@ -462,39 +563,24 @@ def normalize_vacancy(
     return normalized
 
 
-def process_post(
-    post_text: str,
-) -> Optional[Dict[str, Any]]:
-    if not is_vacancy(post_text):
-        return None
-
-    return normalize_vacancy(
-        extract_vacancy(post_text)
-    )
-
-
-def process_post_with_filters(
-    post_text: str,
+def _process_single_vacancy(
+    vacancy_text: str,
     filters: List[Dict[str, Any]],
+    category: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Обрабатывает пост и проверяет его по всем активным фильтрам.
-
-    Пользовательский фильтр проверяется независимо от
-    общего классификатора вакансий.
-
-    Возвращает:
-
-    {
-        "is_vacancy": bool,
-        "vacancy_data": dict | None,
-        "matched_filters": list,
-        "filter_results": list,
-    }
+    Проверяет одну конкретную вакансию по всем фильтрам.
     """
+    contextual_text = vacancy_text
+
+    if category:
+        contextual_text = (
+            f"{category}\n"
+            f"{vacancy_text}"
+        )
 
     vacancy_data = normalize_vacancy(
-        extract_vacancy(post_text or "")
+        extract_vacancy(contextual_text)
     )
 
     filter_results: List[Dict[str, Any]] = []
@@ -508,7 +594,7 @@ def process_post_with_filters(
             continue
 
         filter_result = check_vacancy_against_filter(
-            vacancy_text=post_text,
+            vacancy_text=contextual_text,
             filter_data=filter_item,
         )
 
@@ -542,31 +628,224 @@ def process_post_with_filters(
             "match_result": filter_result,
         }
 
-        filter_results.append(
-            result
-        )
+        filter_results.append(result)
 
         if result["matched"]:
-            matched_filters.append(
-                result
-            )
+            matched_filters.append(result)
 
-    generic_vacancy = is_vacancy(
-        post_text or ""
+    return {
+        "vacancy_data": vacancy_data,
+        "matched_filters": matched_filters,
+        "filter_results": filter_results,
+    }
+
+
+def process_post(
+    post_text: str,
+) -> Optional[Dict[str, Any]]:
+    post_type = detect_post_type(
+        post_text
     )
 
-    is_vacancy_result = bool(
-        generic_vacancy
-        or matched_filters
+    if post_type == "unknown":
+        return None
+
+    if post_type in {
+        "digest",
+        "daily_digest",
+    }:
+        items = extract_digest_items(
+            post_text
+        )
+
+        if not items:
+            return None
+
+        first = items[0]
+
+        return normalize_vacancy(
+            extract_vacancy(
+                first["text"]
+            )
+        )
+
+    return normalize_vacancy(
+        extract_vacancy(post_text)
+    )
+
+
+def process_post_with_filters(
+    post_text: str,
+    filters: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Обрабатывает обычную вакансию или дайджест.
+
+    Для обычного поста:
+        vacancies = [одна вакансия]
+
+    Для дайджеста:
+        vacancies = [вакансия 1, вакансия 2, ...]
+
+    Каждая вакансия отдельно проверяется по каждому фильтру.
+    """
+    post_text = post_text or ""
+
+    post_type = detect_post_type(
+        post_text
+    )
+
+    if post_type == "unknown":
+        return {
+            "is_vacancy": False,
+            "post_type": "unknown",
+            "vacancy_data": None,
+            "vacancies": [],
+            "matched_filters": [],
+            "filter_results": [],
+        }
+
+    # -------------------------
+    # Обычная вакансия
+    # -------------------------
+    if post_type == "vacancy":
+        processed = _process_single_vacancy(
+            vacancy_text=post_text,
+            filters=filters,
+        )
+
+        return {
+            "is_vacancy": True,
+            "post_type": "vacancy",
+            "vacancy_data": processed[
+                "vacancy_data"
+            ],
+            "vacancies": [
+                {
+                    "index": 1,
+                    "title": processed[
+                        "vacancy_data"
+                    ].get(
+                        "title"
+                    ),
+                    "text": post_text.strip(),
+                    "category": None,
+                    "vacancy_data": processed[
+                        "vacancy_data"
+                    ],
+                    "matched_filters": processed[
+                        "matched_filters"
+                    ],
+                    "filter_results": processed[
+                        "filter_results"
+                    ],
+                }
+            ],
+            "matched_filters": processed[
+                "matched_filters"
+            ],
+            "filter_results": processed[
+                "filter_results"
+            ],
+        }
+
+    # -------------------------
+    # Дайджест
+    # -------------------------
+    items = extract_digest_items(
+        post_text
+    )
+
+    if not items:
+        return {
+            "is_vacancy": False,
+            "post_type": post_type,
+            "vacancy_data": None,
+            "vacancies": [],
+            "matched_filters": [],
+            "filter_results": [],
+        }
+
+    processed_vacancies: List[
+        Dict[str, Any]
+    ] = []
+
+    all_matched_filters: List[
+        Dict[str, Any]
+    ] = []
+
+    all_filter_results: List[
+        Dict[str, Any]
+    ] = []
+
+    for index, item in enumerate(
+        items,
+        start=1,
+    ):
+        processed = _process_single_vacancy(
+            vacancy_text=item["text"],
+            filters=filters,
+            category=item.get(
+                "category"
+            ),
+        )
+
+        vacancy_result = {
+            "index": index,
+            "title": item.get(
+                "title"
+            ),
+            "text": item.get(
+                "text",
+                "",
+            ),
+            "category": item.get(
+                "category"
+            ),
+            "vacancy_data": processed[
+                "vacancy_data"
+            ],
+            "matched_filters": processed[
+                "matched_filters"
+            ],
+            "filter_results": processed[
+                "filter_results"
+            ],
+        }
+
+        processed_vacancies.append(
+            vacancy_result
+        )
+
+        all_matched_filters.extend(
+            processed[
+                "matched_filters"
+            ]
+        )
+
+        all_filter_results.extend(
+            processed[
+                "filter_results"
+            ]
+        )
+
+    has_matching_vacancy = any(
+        vacancy["matched_filters"]
+        for vacancy in processed_vacancies
     )
 
     return {
-        "is_vacancy": is_vacancy_result,
+        "is_vacancy": True,
+        "post_type": post_type,
         "vacancy_data": (
-            vacancy_data
-            if is_vacancy_result
+            processed_vacancies[0][
+                "vacancy_data"
+            ]
+            if processed_vacancies
             else None
         ),
-        "matched_filters": matched_filters,
-        "filter_results": filter_results,
+        "vacancies": processed_vacancies,
+        "matched_filters": all_matched_filters,
+        "filter_results": all_filter_results,
+        "has_matching_vacancy": has_matching_vacancy,
     }
