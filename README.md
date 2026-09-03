@@ -277,7 +277,7 @@ missing_conditions:
 ```text
 Найдена подходящая вакансия.
 
-Канал: вакансии тест
+Канал: вакансии
 
 Подходящие фильтры:
 • продуктовый дизайнер
@@ -285,11 +285,11 @@ missing_conditions:
 
 Текст вакансии:
 
-UI/UX Designer в Softnetix
+UI/UX Designer
 ...
 
 Открыть пост:
-https://t.me/testvakansyi/12
+https://t.me/vacancy/1
 ```
 
 Уведомление отправляется непосредственно пользователю:
@@ -297,8 +297,6 @@ https://t.me/testvakansyi/12
 ```text
 chat_id = user_id
 ```
-
-Общий `NOTIFICATION_CHAT_ID` не используется.
 
 ---
 
@@ -438,7 +436,7 @@ message_id
 | Язык                   | Python 3.11+          |
 | Telegram Bot API       | `python-telegram-bot` |
 | Telegram User API      | `Telethon`            |
-| База данных            | MongoDB               |
+| База данных            | `MongoDB`             |
 | MongoDB driver         | `motor`               |
 | MongoDB client         | `pymongo`             |
 | Конфигурация           | `python-dotenv`       |
