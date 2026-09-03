@@ -965,30 +965,14 @@ def match_filter(
     # Final matching decision
     # ---------------------------------------------------------------
 
-    #
-    # Important:
-    #
-    # We intentionally don't require every "required" condition to match
-    # lexically anymore.
-    #
-    # A required condition means "important", not necessarily
-    # "must contain these exact words".
-    #
-    # This makes the matcher suitable for the next semantic layer.
-    #
-    # Conservative threshold for now:
-    #
-    #   70+ -> matched
-    #
-    # Semantic matching can later increase the score for equivalent wording.
-    #
 
     if excluded_found:
         matched = False
     elif not required and not optional:
         matched = True
     else:
-        matched = score >= 70
+        matched = score >= threshold
+
 
     # ---------------------------------------------------------------
     # Details

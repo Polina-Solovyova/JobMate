@@ -57,6 +57,9 @@ ITEM_START_PATTERNS = [
 JOB_TITLE_HINTS = (
     "разработчик",
     "developer",
+    "frontend developer",
+    "backend developer",
+    "fullstack developer",
     "engineer",
     "инженер",
     "дизайнер",
@@ -66,40 +69,16 @@ JOB_TITLE_HINTS = (
     "менеджер",
     "manager",
     "маркетолог",
-    "marketing",
     "копирайтер",
     "copywriter",
-    "контент",
-    "content",
-    "product",
-    "продакт",
-    "project",
-    "проект",
-    "qa",
-    "тестировщик",
-    "researcher",
     "исследователь",
+    "researcher",
     "архитектор",
-    "архитект",
-    "hr",
+    "architect",
     "рекрутер",
     "recruiter",
-    "sales",
-    "продаж",
-    "юрист",
-    "lawyer",
-    "финанс",
-    "accountant",
-    "бухгалтер",
-    "ux",
-    "ui",
-    "frontend",
-    "backend",
-    "fullstack",
-    "full-stack",
-    "devops",
-    "data scientist",
-    "data analyst",
+    "тестировщик",
+    "qa",
 )
 
 
@@ -240,6 +219,48 @@ def _is_separator(line: str) -> bool:
     return False
 
 
+def _extract_inline_category(
+    line: str,
+) -> str | None:
+    normalized = line.lower().strip()
+
+    if re.search(
+        r"\b(?:стаж[её]р|intern|internship)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return "Стажёр"
+
+    if re.search(
+        r"\b(?:junior|джуниор|джун)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return "Junior"
+
+    if re.search(
+        r"\b(?:middle|мидл)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return "Middle"
+
+    if re.search(
+        r"\b(?:senior|сеньор)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return "Senior"
+
+    if re.search(
+        r"\b(?:lead|лид)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return "Lead"
+
+    return None
+
 def split_digest_into_items(text: str) -> List[Dict[str, Any]]:
     """
     Разбивает дайджест на отдельные вакансии.
@@ -289,7 +310,12 @@ def split_digest_into_items(text: str) -> List[Dict[str, Any]]:
             cleaned_lines
         )
 
-        if category_context:
+        category = category_context
+
+        if category is None:
+            category = _extract_inline_category(title)        
+
+        if category:
             contextual_text = (
                 f"{category_context}\n"
                 f"{item_text}"
@@ -301,7 +327,7 @@ def split_digest_into_items(text: str) -> List[Dict[str, Any]]:
             {
                 "title": title,
                 "text": contextual_text.strip(),
-                "category": category_context,
+                "category": category,
             }
         )
 

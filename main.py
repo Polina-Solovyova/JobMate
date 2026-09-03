@@ -133,18 +133,11 @@ async def _send_match_notification(
     vacancy_result: dict,
 ):
     """
-    Отправляет уведомление по одной найденной вакансии.
+    Отправляет одно уведомление по одной найденной вакансии.
 
     Если вакансия совпала с несколькими фильтрами,
-    уведомление отправляется отдельно для каждого фильтра.
+    все подходящие фильтры передаются в одно уведомление.
     """
-
-    global application
-
-    if application is None:
-        logger.error("Application is not initialized")
-        return
-
     matched_filters = vacancy_result.get(
         "matched_filters",
         [],
@@ -156,7 +149,7 @@ async def _send_match_notification(
     vacancy_data = vacancy_result.get(
         "vacancy_data"
     )
-    
+
     if not vacancy_data:
         return
 
@@ -168,44 +161,44 @@ async def _send_match_notification(
         )
     )
 
-    for match_result in matched_filters:
-        score = int(
-            match_result.get(
-                "score",
-                0,
-            )
-        )
-        
-        filter_names = [
-            item.get("filter_name")
+    filter_names = [
+        item.get("filter_name")
+        for item in matched_filters
+        if isinstance(item, dict)
+        and item.get("filter_name")
+    ]
+
+    score = max(
+        (
+            int(item.get("score", 0))
             for item in matched_filters
-            if isinstance(item, dict) and item.get("filter_name")
-        ]
+            if isinstance(item, dict)
+        ),
+        default=0,
+    )
 
-        matched_conditions = match_result.get(
-            "matched_conditions",
-            [],
-        )
+    logger.info(
+        "MATCH: user=%s channel=%s message=%s "
+        "vacancy=%s filters=%s max_score=%s",
+        user_id,
+        channel_id,
+        message_id,
+        vacancy_data.get("title"),
+        filter_names,
+        score,
+    )
 
-        logger.info(
-            "MATCH: user=%s channel=%s message=%s "
-            "vacancy=%s filter=%s score=%s",
-            user_id,
-            channel_id,
-            message_id,
-            vacancy_data.get("title"),
-            filter_names,
-            score,
-        )
-
-        await send_vacancy_notification(
-            user_id=user_id,
-            text=vacancy_data.get("description", ""),
-            channel_title=vacancy_data.get("channel_title"),
-            channel_username=channel_username,
-            post_link=post_link,
-            matched_filters=filter_names,
-        )
+    await send_vacancy_notification(
+        user_id=user_id,
+        text=vacancy_data.get("description", ""),
+        channel_title=(
+            vacancy_data.get("company")
+            or channel_username
+        ),
+        channel_username=channel_username,
+        post_link=post_link,
+        matched_filters=filter_names,
+    )
 
 
 # ============================================================

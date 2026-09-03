@@ -518,6 +518,49 @@ def _extract_skills(
     return sorted(set(found))
 
 
+def _extract_category(
+    text: str,
+) -> Optional[str]:
+    normalized = _normalize_text(text)
+
+    if re.search(
+        r"\b(?:стаж[её]р|intern|internship)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return "Стажёр"
+
+    if re.search(
+        r"\b(?:junior|джуниор|джун)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return "Junior"
+
+    if re.search(
+        r"\b(?:middle|мидл)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return "Middle"
+
+    if re.search(
+        r"\b(?:senior|сеньор)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return "Senior"
+
+    if re.search(
+        r"\b(?:lead|лид)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return "Lead"
+
+    return None
+
+
 def extract_vacancy(
     text: str,
 ) -> Dict[str, Any]:
@@ -640,40 +683,6 @@ def _process_single_vacancy(
     }
 
 
-def process_post(
-    post_text: str,
-) -> Optional[Dict[str, Any]]:
-    post_type = detect_post_type(
-        post_text
-    )
-
-    if post_type == "unknown":
-        return None
-
-    if post_type in {
-        "digest",
-        "daily_digest",
-    }:
-        items = extract_digest_items(
-            post_text
-        )
-
-        if not items:
-            return None
-
-        first = items[0]
-
-        return normalize_vacancy(
-            extract_vacancy(
-                first["text"]
-            )
-        )
-
-    return normalize_vacancy(
-        extract_vacancy(post_text)
-    )
-
-
 def process_post_with_filters(
     post_text: str,
     filters: List[Dict[str, Any]],
@@ -729,7 +738,7 @@ def process_post_with_filters(
                         "title"
                     ),
                     "text": post_text.strip(),
-                    "category": None,
+                    "category": _extract_category(post_text),
                     "vacancy_data": processed[
                         "vacancy_data"
                     ],
