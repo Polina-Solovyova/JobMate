@@ -373,6 +373,13 @@ async def main_menu_callback(
 async def post_processor(
     post: dict,
 ):
+    logger.info(
+        "POST PROCESSOR CALLED: user=%s channel=%s message_id=%s text=%r",
+        user_id,
+        channel_id,
+        message_id,
+        text[:300],
+    )
     user_id = int(
         post["user_id"]
     )
@@ -406,6 +413,7 @@ async def post_processor(
         vacancy_data = result.get(
             "vacancy_data"
         )
+
 
         await mark_post_processed(
             user_id=user_id,
@@ -454,7 +462,19 @@ async def post_processor(
             else str(item)
             for item in matched_filters
         ]
-
+        
+        logger.info(
+            "FILTER RESULT: user=%s is_vacancy=%s matched_filters=%r",
+            user_id,
+            is_vacancy,
+            matched_filters,
+        )
+        
+        logger.info(
+            "SENDING VACANCY NOTIFICATION: user=%s filters=%r",
+            user_id,
+            matched_filter_names,
+        )
         await send_vacancy_notification(
             user_id=user_id,
             text=text,
